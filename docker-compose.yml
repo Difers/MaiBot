@@ -1,12 +1,9 @@
 services:
   core:
     container_name: maim-bot-core
-    #### prod ####
-    image: sengokucola/maibot:latest
-    # image: infinitycat/maibot:latest
-    #### dev ####
-    # image: sengokucola/maibot:dev
-    # image: infinitycat/maibot:dev
+    build:
+      context: .
+      dockerfile: Dockerfile
     environment:
       - TZ=Asia/Shanghai
       - EULA_AGREE=8e6e7d647f7f82d6ea98456b73908656
