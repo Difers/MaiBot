@@ -1,8 +1,9 @@
 # 使用基于时间戳的文件处理器，简单的轮转份数限制
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional, TextIO
 
 import asyncio
 import json
@@ -71,6 +72,19 @@ def get_console_handler():
         console_level = LOG_CONFIG.get("console_log_level", LOG_CONFIG.get("log_level", "INFO"))
         _console_handler.setLevel(getattr(logging, console_level.upper(), logging.INFO))
     return _console_handler
+
+
+@contextmanager
+def redirect_console_logs(stream: TextIO) -> Iterator[None]:
+    """临时把主控制台日志接到可安全重绘的输出流。"""
+
+    handler = get_console_handler()
+    original_stream = handler.stream
+    handler.setStream(stream)
+    try:
+        yield
+    finally:
+        handler.setStream(original_stream)
 
 
 def get_ws_handler():
@@ -253,7 +267,12 @@ class WebSocketLogHandler(logging.Handler):
             try:
                 log_dict = json.loads(formatted_msg)
                 message = log_dict.get("event", formatted_msg)
-                module_name = log_dict.get("logger_name") or log_dict.get("module") or record.name
+                module_name = (
+                    log_dict.get("logger_name")
+                    or log_dict.get("logger")
+                    or log_dict.get("module")
+                    or record.name
+                )
                 level_name = str(log_dict.get("level") or record.levelname).upper()
             except (json.JSONDecodeError, ValueError):
                 # 不是 JSON,直接使用消息
@@ -269,6 +288,7 @@ class WebSocketLogHandler(logging.Handler):
                 "timestamp": datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S"),
                 "level": level_name,
                 "module": module_name,
+                "moduleDisplayName": MODULE_ALIASES.get(module_name, module_name),
                 "message": message,
             }
 

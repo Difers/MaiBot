@@ -29,13 +29,18 @@ import {
   updateModelConfig,
   updateModelConfigSection,
 } from '@/lib/config-api'
-import type { ModelConfigVersionInfo, ModelTestResult, TestConnectionResult } from '@/lib/config-api'
+import type {
+  ModelConfigVersionInfo,
+  ModelTestResult,
+  TestConnectionResult,
+} from '@/lib/config-api'
 import { useToast } from '@/hooks/use-toast'
 import type { ConfigSchema } from '@/types/config-schema'
 
 import type { ModelInfo, ModelTaskConfig, ProviderConfig, TaskConfig } from '../types'
 import type { APIProvider, DeleteConfirmState } from '../../modelProvider/types'
 import { cleanProviderData } from '../../modelProvider/utils'
+import { findTemplateByBaseUrl } from '../../providerTemplates'
 import { useModelAutoSave } from './useModelAutoSave'
 import { useEmbeddingWarning, type PendingEmbeddingUpdate } from './useEmbeddingWarning'
 
@@ -67,6 +72,18 @@ export interface ModelFormErrors {
   model_identifier?: string
 }
 
+interface ProviderSaveBarrierCheckpoint {
+  generation: number
+  sourceSnapshot: string
+  targetSnapshot: string
+}
+
+interface ConfigDraftPersistResult {
+  applyModels: boolean
+  applyProviders: boolean
+  applyTaskConfig: boolean
+}
+
 export function useModelConfig() {
   const { toast } = useToast()
 
@@ -81,11 +98,17 @@ export function useModelConfig() {
   // ---- 加载 / 保存状态 ----
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
-  const [autoSaving, setAutoSaving] = useState(false)
-  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false)
+  const [modelAutoSaving, setModelAutoSaving] = useState(false)
+  const [providerAutoSaving, setProviderAutoSaving] = useState(false)
+  const [modelHasUnsavedChanges, setModelHasUnsavedChanges] = useState(false)
+  const [providerHasUnsavedChanges, setProviderHasUnsavedChanges] = useState(false)
+  const autoSaving = modelAutoSaving || providerAutoSaving
+  const hasUnsavedChanges = modelHasUnsavedChanges || providerHasUnsavedChanges
 
   // ---- 模型配置文件副本 ----
-  const [activeConfigVersion, setActiveConfigVersion] = useState<ModelConfigVersionInfo | null>(null)
+  const [activeConfigVersion, setActiveConfigVersion] = useState<ModelConfigVersionInfo | null>(
+    null
+  )
   const [configVersions, setConfigVersions] = useState<ModelConfigVersionInfo[]>([])
   const [versionsLoading, setVersionsLoading] = useState(false)
   const [switchingConfigVersion, setSwitchingConfigVersion] = useState<string | null>(null)
@@ -108,10 +131,9 @@ export function useModelConfig() {
 
   // ---- 搜索 / 分页 / 批量选择 ----
   const [searchQuery, setSearchQuery] = useState('')
+  const [modelProviderFilter, setModelProviderFilter] = useState('')
   const [selectedModels, setSelectedModels] = useState<Set<number>>(new Set())
-  const [selectedProviders, setSelectedProviders] = useState<Set<number>>(new Set())
   const [batchDeleteDialogOpen, setBatchDeleteDialogOpen] = useState(false)
-  const [providerBatchDeleteDialogOpen, setProviderBatchDeleteDialogOpen] = useState(false)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
   const [jumpToPage, setJumpToPage] = useState('')
@@ -123,7 +145,9 @@ export function useModelConfig() {
   // ---- 单模型能力测试 ----
   const [testingModels, setTestingModels] = useState<Set<string>>(new Set())
   const [modelTestResults, setModelTestResults] = useState<Map<string, ModelTestResult>>(new Map())
-  const [selectedModelTestResult, setSelectedModelTestResult] = useState<ModelTestResult | null>(null)
+  const [selectedModelTestResult, setSelectedModelTestResult] = useState<ModelTestResult | null>(
+    null
+  )
 
   const buildModelTestDetailAction = useCallback(
     (testResult: ModelTestResult): ToastActionElement =>
@@ -159,18 +183,73 @@ export function useModelConfig() {
   // ---- provider 自动保存定时器 / 快照 ----
   const providerAutoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const providersSnapshotRef = useRef<string | null>(null)
+  const latestProvidersSnapshotRef = useRef('')
+  const providerGenerationRef = useRef(0)
+  const providerSaveCountRef = useRef(0)
+  const configWriteChainRef = useRef<Promise<void>>(Promise.resolve())
+  latestProvidersSnapshotRef.current = JSON.stringify(apiProviders.map(cleanProviderData))
+
+  const enqueueConfigWrite = useCallback((operation: () => Promise<void>): Promise<void> => {
+    const operationPromise = configWriteChainRef.current.then(operation)
+    // 单次写入失败不能阻断后续保存，但调用方仍会收到本次失败。
+    configWriteChainRef.current = operationPromise.catch(() => undefined)
+    return operationPromise
+  }, [])
 
   // 自动保存 models / taskConfig（沿用既有 hook）
   const {
-    clearTimers: clearAutoSaveTimers,
+    cancelPendingTimers: cancelModelAutoSaveTimers,
+    commitSaveBarrier,
     initialLoadRef,
+    prepareSaveBarrier,
     resetSnapshots,
   } = useModelAutoSave({
     models,
     taskConfig,
-    onSavingChange: setAutoSaving,
-    onUnsavedChange: setHasUnsavedChanges,
+    enqueueWrite: enqueueConfigWrite,
+    onSavingChange: setModelAutoSaving,
+    onUnsavedChange: setModelHasUnsavedChanges,
   })
+
+  const cancelProviderAutoSaveTimer = useCallback(() => {
+    if (providerAutoSaveTimerRef.current) {
+      clearTimeout(providerAutoSaveTimerRef.current)
+      providerAutoSaveTimerRef.current = null
+    }
+  }, [])
+
+  const prepareProviderSaveBarrier = useCallback(
+    (nextProviders: APIProvider[]): ProviderSaveBarrierCheckpoint => {
+      cancelProviderAutoSaveTimer()
+      return {
+        generation: providerGenerationRef.current,
+        sourceSnapshot: latestProvidersSnapshotRef.current,
+        targetSnapshot: JSON.stringify(nextProviders.map(cleanProviderData)),
+      }
+    },
+    [cancelProviderAutoSaveTimer]
+  )
+
+  const commitProviderSaveBarrier = useCallback(
+    (checkpoint: ProviderSaveBarrierCheckpoint): boolean => {
+      providersSnapshotRef.current = checkpoint.targetSnapshot
+      const applyProviders =
+        checkpoint.generation === providerGenerationRef.current &&
+        checkpoint.sourceSnapshot === latestProvidersSnapshotRef.current
+
+      if (applyProviders) {
+        latestProvidersSnapshotRef.current = checkpoint.targetSnapshot
+      }
+      setProviderHasUnsavedChanges(latestProvidersSnapshotRef.current !== checkpoint.targetSnapshot)
+      return applyProviders
+    },
+    []
+  )
+
+  const updateProviderSavingCount = useCallback((delta: number) => {
+    providerSaveCountRef.current += delta
+    setProviderAutoSaving(providerSaveCountRef.current > 0)
+  }, [])
 
   // 检查任务配置问题
   const checkTaskConfigIssues = useCallback(
@@ -276,9 +355,12 @@ export function useModelConfig() {
       setProviders(providerList.map((p) => p.name))
       setProviderConfigs(providerList)
       setApiProviders(providerList.map((provider) => cleanProviderData(provider as APIProvider)))
-      providersSnapshotRef.current = JSON.stringify(
+      const providersSnapshot = JSON.stringify(
         providerList.map((provider) => cleanProviderData(provider as APIProvider))
       )
+      providersSnapshotRef.current = providersSnapshot
+      latestProvidersSnapshotRef.current = providersSnapshot
+      providerGenerationRef.current += 1
 
       const taskConf = (config.model_task_config as ModelTaskConfig) || null
       setTaskConfig(taskConf)
@@ -306,7 +388,8 @@ export function useModelConfig() {
       // 初始化上一次的 embedding 模型列表
       const embeddingModels = taskConf?.embedding?.model_list || []
       setPreviousEmbedding(embeddingModels)
-      setHasUnsavedChanges(false)
+      setModelHasUnsavedChanges(false)
+      setProviderHasUnsavedChanges(false)
       initialLoadRef.current = false
     } catch (error) {
       console.error('加载配置失败:', error)
@@ -326,6 +409,14 @@ export function useModelConfig() {
       return providerConfigs.find((p) => p.name === providerName)
     },
     [providerConfigs]
+  )
+
+  const isDeepSeekTemplateProvider = useCallback(
+    (providerName: string): boolean => {
+      const provider = getProviderConfig(providerName)
+      return provider ? findTemplateByBaseUrl(provider.base_url)?.id === 'deepseek' : false
+    },
+    [getProviderConfig]
   )
 
   // 清理模型中的 null 值（TOML 不支持 null）
@@ -438,12 +529,45 @@ export function useModelConfig() {
     [apiProviders, models]
   )
 
-  const saveProviders = useCallback(
+  const persistModelConfigDraft = useCallback(
     async (
-      nextProviders: APIProvider[],
-      context: 'auto' | 'manual' = 'auto',
-      affectedModels: unknown[] = []
-    ) => {
+      nextModels: ModelInfo[],
+      nextTaskConfig: ModelTaskConfig | null,
+      nextApiProviders: APIProvider[]
+    ): Promise<ConfigDraftPersistResult> => {
+      const modelCheckpoint = prepareSaveBarrier(nextModels, nextTaskConfig)
+      const providerCheckpoint = prepareProviderSaveBarrier(nextApiProviders)
+
+      // 屏障在首次 await 前入队；此后产生的自动保存只能排在整份写入之后。
+      const savePromise = enqueueConfigWrite(async () => {
+        const config = unwrapModelConfig(await getModelConfig())
+        config.api_providers = nextApiProviders.map(cleanProviderData)
+        config.models = nextModels.map(cleanModelForSave)
+        config.model_task_config = nextTaskConfig
+        await updateModelConfig(config)
+      })
+      await savePromise
+
+      const modelCommit = commitSaveBarrier(modelCheckpoint)
+      const applyProviders = commitProviderSaveBarrier(providerCheckpoint)
+      return {
+        applyModels: modelCommit.applyModels,
+        applyProviders,
+        applyTaskConfig: modelCommit.applyTaskConfig,
+      }
+    },
+    [
+      cleanModelForSave,
+      commitProviderSaveBarrier,
+      commitSaveBarrier,
+      enqueueConfigWrite,
+      prepareProviderSaveBarrier,
+      prepareSaveBarrier,
+    ]
+  )
+
+  const saveProviders = useCallback(
+    async (nextProviders: APIProvider[], affectedModels: unknown[] = []) => {
       const cleanedProviders = nextProviders.map(cleanProviderData)
       const { models: nextModels, taskConfig: nextTaskConfig } = removeModelsForProviders(
         models,
@@ -451,28 +575,29 @@ export function useModelConfig() {
         affectedModels
       )
 
-      if (context === 'auto' && affectedModels.length === 0) {
-        await updateModelConfigSection('api_providers', cleanedProviders)
-      } else {
-        const config = unwrapModelConfig(await getModelConfig())
-        config.api_providers = cleanedProviders
-        config.models = nextModels.map(cleanModelForSave)
-        config.model_task_config = nextTaskConfig
-        await updateModelConfig(config)
+      const persistResult = await persistModelConfigDraft(
+        nextModels,
+        nextTaskConfig,
+        cleanedProviders
+      )
+      if (persistResult.applyProviders) {
+        syncProviderState(cleanedProviders)
       }
-
-      syncProviderState(cleanedProviders)
-      setModels(nextModels)
-      setModelNames(nextModels.map((model) => model.name))
-      setTaskConfig(nextTaskConfig)
-      checkTaskConfigIssues(nextTaskConfig, nextModels)
-      providersSnapshotRef.current = JSON.stringify(cleanedProviders)
-      setHasUnsavedChanges(false)
+      if (persistResult.applyModels) {
+        setModels(nextModels)
+        setModelNames(nextModels.map((model) => model.name))
+      }
+      if (persistResult.applyTaskConfig) {
+        setTaskConfig(nextTaskConfig)
+      }
+      if (persistResult.applyModels && persistResult.applyTaskConfig) {
+        checkTaskConfigIssues(nextTaskConfig, nextModels)
+      }
     },
     [
       checkTaskConfigIssues,
-      cleanModelForSave,
       models,
+      persistModelConfigDraft,
       removeModelsForProviders,
       syncProviderState,
       taskConfig,
@@ -480,30 +605,60 @@ export function useModelConfig() {
   )
 
   const autoSaveProviders = useCallback(
-    async (nextProviders: APIProvider[]) => {
+    async (nextProviders: APIProvider[], snapshot: string, generation: number) => {
       if (initialLoadRef.current) return
-      const { shouldProceed } = await checkDeleteProviderImpact(nextProviders, 'auto')
-      if (!shouldProceed) {
-        setHasUnsavedChanges(true)
+      if (
+        generation !== providerGenerationRef.current ||
+        snapshot !== latestProvidersSnapshotRef.current
+      ) {
         return
       }
 
+      const { shouldProceed } = await checkDeleteProviderImpact(nextProviders, 'auto')
+      if (!shouldProceed) {
+        setProviderHasUnsavedChanges(true)
+        return
+      }
+      if (
+        generation !== providerGenerationRef.current ||
+        snapshot !== latestProvidersSnapshotRef.current
+      ) {
+        return
+      }
+
+      updateProviderSavingCount(1)
       try {
-        setAutoSaving(true)
-        await saveProviders(nextProviders, 'auto')
+        await enqueueConfigWrite(async () => {
+          await updateModelConfigSection('api_providers', nextProviders.map(cleanProviderData))
+        })
+        if (
+          generation === providerGenerationRef.current &&
+          snapshot === latestProvidersSnapshotRef.current
+        ) {
+          providersSnapshotRef.current = snapshot
+          setProviderHasUnsavedChanges(false)
+        }
       } catch (error) {
         console.error('自动保存提供商失败:', error)
-        toast({
-          title: '自动保存失败',
-          description: (error as Error).message,
-          variant: 'destructive',
-        })
-        setHasUnsavedChanges(true)
+        if (generation === providerGenerationRef.current) {
+          toast({
+            title: '自动保存失败',
+            description: (error as Error).message,
+            variant: 'destructive',
+          })
+          setProviderHasUnsavedChanges(true)
+        }
       } finally {
-        setAutoSaving(false)
+        updateProviderSavingCount(-1)
       }
     },
-    [checkDeleteProviderImpact, initialLoadRef, saveProviders, toast]
+    [
+      checkDeleteProviderImpact,
+      enqueueConfigWrite,
+      initialLoadRef,
+      toast,
+      updateProviderSavingCount,
+    ]
   )
 
   // 监听 apiProviders 变化，防抖自动保存
@@ -514,19 +669,22 @@ export function useModelConfig() {
       providersSnapshotRef.current = snapshot
       return
     }
-    if (snapshot === providersSnapshotRef.current) return
 
-    setHasUnsavedChanges(true)
-    if (providerAutoSaveTimerRef.current) {
-      clearTimeout(providerAutoSaveTimerRef.current)
-    }
+    providerGenerationRef.current += 1
+    const generation = providerGenerationRef.current
+    const dirty = snapshot !== providersSnapshotRef.current || providerSaveCountRef.current > 0
+    setProviderHasUnsavedChanges(dirty)
+    if (!dirty) return
+
     providerAutoSaveTimerRef.current = setTimeout(() => {
-      autoSaveProviders(apiProviders)
+      providerAutoSaveTimerRef.current = null
+      void autoSaveProviders(apiProviders, snapshot, generation)
     }, 2000)
 
     return () => {
       if (providerAutoSaveTimerRef.current) {
         clearTimeout(providerAutoSaveTimerRef.current)
+        providerAutoSaveTimerRef.current = null
       }
     }
   }, [apiProviders, autoSaveProviders, initialLoadRef])
@@ -560,40 +718,26 @@ export function useModelConfig() {
   }, [taskConfig, models, toast])
 
   const persistCurrentDraft = useCallback(async () => {
-    clearAutoSaveTimers()
-    if (providerAutoSaveTimerRef.current) {
-      clearTimeout(providerAutoSaveTimerRef.current)
-      providerAutoSaveTimerRef.current = null
-    }
-
-    const config = unwrapModelConfig(await getModelConfig())
-    config.api_providers = apiProviders.map(cleanProviderData)
-    config.models = models.map(cleanModelForSave)
-    config.model_task_config = taskConfig
-    await updateModelConfig(config)
-    resetSnapshots(config.models as ModelInfo[], taskConfig)
-    providersSnapshotRef.current = JSON.stringify(config.api_providers)
-    setHasUnsavedChanges(false)
-  }, [
-    apiProviders,
-    clearAutoSaveTimers,
-    cleanModelForSave,
-    models,
-    resetSnapshots,
-    taskConfig,
-  ])
+    return persistModelConfigDraft(models, taskConfig, apiProviders)
+  }, [apiProviders, models, persistModelConfigDraft, taskConfig])
 
   // 保存配置（手动保存）
   const saveConfig = useCallback(async () => {
     try {
       setSaving(true)
 
-      await persistCurrentDraft()
+      const persistResult = await persistCurrentDraft()
       toast({
         title: '保存成功',
         description: '模型配置已保存',
       })
-      await loadConfig() // 重新加载以更新模型名称列表
+      if (
+        persistResult.applyModels &&
+        persistResult.applyProviders &&
+        persistResult.applyTaskConfig
+      ) {
+        await loadConfig() // 保存期间没有新编辑时再重新加载，避免覆盖屏障后的草稿。
+      }
     } catch (error) {
       console.error('保存配置失败:', error)
       toast({
@@ -644,13 +788,12 @@ export function useModelConfig() {
         if (hasUnsavedChanges) {
           await persistCurrentDraft()
         } else {
-          clearAutoSaveTimers()
-          if (providerAutoSaveTimerRef.current) {
-            clearTimeout(providerAutoSaveTimerRef.current)
-            providerAutoSaveTimerRef.current = null
-          }
+          cancelModelAutoSaveTimers()
+          cancelProviderAutoSaveTimer()
         }
-        await switchModelConfigVersion(versionId)
+        await enqueueConfigWrite(async () => {
+          await switchModelConfigVersion(versionId)
+        })
         await loadConfig()
         toast({
           title: '副本已切换',
@@ -667,7 +810,15 @@ export function useModelConfig() {
         setSaving(false)
       }
     },
-    [clearAutoSaveTimers, hasUnsavedChanges, loadConfig, persistCurrentDraft, toast]
+    [
+      cancelModelAutoSaveTimers,
+      cancelProviderAutoSaveTimer,
+      enqueueConfigWrite,
+      hasUnsavedChanges,
+      loadConfig,
+      persistCurrentDraft,
+      toast,
+    ]
   )
 
   const handleDeleteConfigVersion = useCallback(
@@ -696,14 +847,16 @@ export function useModelConfig() {
       // 清除表单验证错误
       setFormErrors({})
 
+      const defaultProvider = providers[0] || ''
+
       setEditingModel(
         model || {
           model_identifier: '',
           name: '',
-          api_provider: providers[0] || '',
+          api_provider: defaultProvider,
           price_in: 0,
           price_out: 0,
-          cache: false,
+          cache: isDeepSeekTemplateProvider(defaultProvider),
           cache_price_in: 0,
           temperature: null,
           max_tokens: null,
@@ -716,7 +869,7 @@ export function useModelConfig() {
       setEditingIndex(index)
       setEditDialogOpen(true)
     },
-    [providers]
+    [isDeepSeekTemplateProvider, providers]
   )
 
   const openProviderDialog = useCallback((provider: APIProvider | null, index: number | null) => {
@@ -745,11 +898,6 @@ export function useModelConfig() {
         nextProviders.push(providerToSave)
       }
 
-      if (providerAutoSaveTimerRef.current) {
-        clearTimeout(providerAutoSaveTimerRef.current)
-      }
-      clearAutoSaveTimers()
-
       const { shouldProceed } = await checkDeleteProviderImpact(nextProviders, 'manual')
       if (!shouldProceed) {
         setProviderDialogOpen(false)
@@ -760,7 +908,7 @@ export function useModelConfig() {
 
       try {
         setSaving(true)
-        await saveProviders(nextProviders, 'manual')
+        await saveProviders(nextProviders)
         setProviderDialogOpen(false)
         setEditingProvider(null)
         setEditingProviderIndex(null)
@@ -778,17 +926,11 @@ export function useModelConfig() {
         setSaving(false)
       }
     },
-    [
-      apiProviders,
-      checkDeleteProviderImpact,
-      clearAutoSaveTimers,
-      saveProviders,
-      toast,
-    ]
+    [apiProviders, checkDeleteProviderImpact, saveProviders, toast]
   )
 
   // 保存模型编辑
-  const handleSaveEdit = useCallback(() => {
+  const handleSaveEdit = useCallback(async () => {
     if (!editingModel) return
 
     // 验证必填项
@@ -857,32 +999,61 @@ export function useModelConfig() {
       newModels = [...models, modelToSave]
     }
 
-    setModels(newModels)
-    setModelNames(newModels.map((m) => m.name))
-
     // 如果模型名称发生变化，更新任务配置中对该模型的引用
-    if (oldModelName && oldModelName !== modelToSave.name && taskConfig) {
+    const modelRenamed = oldModelName !== null && oldModelName !== modelToSave.name
+    let newTaskConfig = taskConfig
+    if (modelRenamed && taskConfig) {
       const updateModelList = (list: string[]): string[] => {
         return list.map((name) => (name === oldModelName ? modelToSave.name : name))
       }
 
-      const newTaskConfig: ModelTaskConfig = {}
+      newTaskConfig = {}
       for (const [key, task] of Object.entries(taskConfig)) {
         newTaskConfig[key] = { ...task, model_list: updateModelList(task?.model_list || []) }
       }
-      setTaskConfig(newTaskConfig)
     }
 
-    setEditDialogOpen(false)
-    setEditingModel(null)
-    setEditingIndex(null)
-
-    // 提示用户配置将自动保存
-    toast({
-      title: editingIndex !== null ? '模型已更新' : '模型已添加',
-      description: '配置将在 2 秒后自动保存',
-    })
-  }, [editingIndex, editingModel, models, taskConfig, toast])
+    try {
+      setSaving(true)
+      // 模型名称与任务引用必须在同一次写入中保存，避免热重载读到不一致的中间状态。
+      const persistResult = await persistModelConfigDraft(newModels, newTaskConfig, apiProviders)
+      if (persistResult.applyModels) {
+        setModels(newModels)
+        setModelNames(newModels.map((model) => model.name))
+      }
+      if (persistResult.applyTaskConfig) {
+        setTaskConfig(newTaskConfig)
+      }
+      if (persistResult.applyModels && persistResult.applyTaskConfig) {
+        checkTaskConfigIssues(newTaskConfig, newModels)
+      }
+      setEditDialogOpen(false)
+      setEditingModel(null)
+      setEditingIndex(null)
+      toast({
+        title: editingIndex !== null ? '模型已更新' : '模型已添加',
+        description: modelRenamed ? '模型名称及任务引用已同步保存' : '模型配置已保存',
+      })
+    } catch (error) {
+      console.error('保存模型配置失败:', error)
+      toast({
+        title: '保存失败',
+        description: (error as Error).message,
+        variant: 'destructive',
+      })
+    } finally {
+      setSaving(false)
+    }
+  }, [
+    apiProviders,
+    checkTaskConfigIssues,
+    editingIndex,
+    editingModel,
+    models,
+    persistModelConfigDraft,
+    taskConfig,
+    toast,
+  ])
 
   // 处理编辑对话框关闭
   const handleEditDialogClose = useCallback(
@@ -945,65 +1116,15 @@ export function useModelConfig() {
     setDeletingProviderIndex(null)
   }, [apiProviders, checkDeleteProviderImpact, deletingProviderIndex, syncProviderState, toast])
 
-  // ---- 批量选择 / 删除 ----
-  const toggleProviderSelection = useCallback((index: number) => {
-    setSelectedProviders((prev) => {
-      const nextSelected = new Set(prev)
-      if (nextSelected.has(index)) {
-        nextSelected.delete(index)
-      } else {
-        nextSelected.add(index)
-      }
-      return nextSelected
-    })
-  }, [])
-
-  const toggleSelectAllProviders = useCallback(() => {
-    setSelectedProviders((prev) => {
-      if (prev.size === apiProviders.length) {
-        return new Set()
-      }
-      return new Set(apiProviders.map((_, index) => index))
-    })
-  }, [apiProviders])
-
-  const openProviderBatchDeleteDialog = useCallback(() => {
-    if (selectedProviders.size === 0) {
-      toast({
-        title: '提示',
-        description: '请先选择要删除的提供商',
-        variant: 'default',
-      })
-      return
-    }
-    setProviderBatchDeleteDialogOpen(true)
-  }, [selectedProviders, toast])
-
-  const handleConfirmProviderBatchDelete = useCallback(async () => {
-    const nextProviders = apiProviders.filter((_, index) => !selectedProviders.has(index))
-    const { shouldProceed } = await checkDeleteProviderImpact(nextProviders, 'manual')
-    if (shouldProceed) {
-      const deletedCount = selectedProviders.size
-      syncProviderState(nextProviders)
-      setSelectedProviders(new Set())
-      toast({
-        title: '批量删除成功',
-        description: `已删除 ${deletedCount} 个提供商`,
-      })
-    }
-    setProviderBatchDeleteDialogOpen(false)
-  }, [apiProviders, checkDeleteProviderImpact, selectedProviders, syncProviderState, toast])
-
   const handleConfirmDeleteProviderImpact = useCallback(async () => {
+    const isAutoSave = deleteConfirmState.context === 'auto'
     try {
-      const savingFlag = deleteConfirmState.context === 'auto' ? setAutoSaving : setSaving
-      const saveContext = deleteConfirmState.context === 'auto' ? 'auto' : 'manual'
-      savingFlag(true)
-      await saveProviders(
-        deleteConfirmState.pendingProviders,
-        saveContext,
-        deleteConfirmState.affectedModels
-      )
+      if (isAutoSave) {
+        updateProviderSavingCount(1)
+      } else {
+        setSaving(true)
+      }
+      await saveProviders(deleteConfirmState.pendingProviders, deleteConfirmState.affectedModels)
       toast({
         title: '删除成功',
         description: `已删除 ${deleteConfirmState.providersToDelete.length} 个提供商和 ${deleteConfirmState.affectedModels.length} 个关联模型`,
@@ -1016,7 +1137,6 @@ export function useModelConfig() {
         context: 'auto',
         oldProviders: [],
       })
-      setSelectedProviders(new Set())
     } catch (error) {
       toast({
         title: '删除失败',
@@ -1024,14 +1144,30 @@ export function useModelConfig() {
         variant: 'destructive',
       })
     } finally {
-      setSaving(false)
-      setAutoSaving(false)
+      if (isAutoSave) {
+        updateProviderSavingCount(-1)
+      } else {
+        setSaving(false)
+      }
     }
-  }, [deleteConfirmState, saveProviders, toast])
+  }, [deleteConfirmState, saveProviders, toast, updateProviderSavingCount])
 
   const handleCancelDeleteProviderImpact = useCallback(() => {
-    if (deleteConfirmState.oldProviders.length > 0) {
+    const currentSnapshot = JSON.stringify(apiProviders.map(cleanProviderData))
+    const pendingSnapshot = JSON.stringify(
+      deleteConfirmState.pendingProviders.map(cleanProviderData)
+    )
+    if (deleteConfirmState.oldProviders.length > 0 && currentSnapshot === pendingSnapshot) {
       syncProviderState(deleteConfirmState.oldProviders)
+      const restoredSnapshot = JSON.stringify(
+        deleteConfirmState.oldProviders.map(cleanProviderData)
+      )
+      providersSnapshotRef.current = restoredSnapshot
+      latestProvidersSnapshotRef.current = restoredSnapshot
+      providerGenerationRef.current += 1
+      setProviderHasUnsavedChanges(false)
+    } else {
+      setProviderHasUnsavedChanges(currentSnapshot !== providersSnapshotRef.current)
     }
     setDeleteConfirmState({
       isOpen: false,
@@ -1041,8 +1177,7 @@ export function useModelConfig() {
       context: 'auto',
       oldProviders: [],
     })
-    setHasUnsavedChanges(false)
-  }, [deleteConfirmState, syncProviderState])
+  }, [apiProviders, deleteConfirmState, syncProviderState])
 
   // ---- 提供商连接测试 ----
   const handleTestProviderConnection = useCallback(
@@ -1130,6 +1265,7 @@ export function useModelConfig() {
   const filteredModels = useMemo(
     () =>
       models.filter((model) => {
+        if (modelProviderFilter && model.api_provider !== modelProviderFilter) return false
         if (!searchQuery) return true
         const query = searchQuery.toLowerCase()
         return (
@@ -1138,8 +1274,13 @@ export function useModelConfig() {
           model.api_provider.toLowerCase().includes(query)
         )
       }),
-    [models, searchQuery]
+    [modelProviderFilter, models, searchQuery]
   )
+
+  useEffect(() => {
+    setPage(1)
+    setSelectedModels(new Set())
+  }, [modelProviderFilter, searchQuery])
 
   // 切换单个模型选择
   const toggleModelSelection = useCallback((index: number) => {
@@ -1290,6 +1431,7 @@ export function useModelConfig() {
     formErrors,
     setFormErrors,
     openEditDialog,
+    isDeepSeekTemplateProvider,
     handleSaveEdit,
     handleEditDialogClose,
     deleteDialogOpen,
@@ -1333,19 +1475,13 @@ export function useModelConfig() {
     setBatchDeleteDialogOpen,
     openBatchDeleteDialog,
     handleConfirmBatchDelete,
-    // 提供商批量
-    selectedProviders,
-    toggleProviderSelection,
-    toggleSelectAllProviders,
-    providerBatchDeleteDialogOpen,
-    setProviderBatchDeleteDialogOpen,
-    openProviderBatchDeleteDialog,
-    handleConfirmProviderBatchDelete,
     // 任务配置
     updateTaskConfig,
     // 搜索 / 分页
     searchQuery,
     setSearchQuery,
+    modelProviderFilter,
+    setModelProviderFilter,
     filteredModels,
     paginatedModels,
     page,

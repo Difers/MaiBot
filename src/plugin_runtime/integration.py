@@ -72,6 +72,11 @@ _EVENT_TYPE_MAP: Dict[str, str] = {
     "after_send": "after_send",
 }
 
+_RUNTIME_GROUP_DESCRIPTIONS: Dict[str, str] = {
+    "builtin": "核心插件（内置插件与适配器）",
+    "third_party": "扩展插件（第三方扩展）",
+}
+
 
 @dataclass(frozen=True)
 class DependencySyncState:
@@ -79,6 +84,16 @@ class DependencySyncState:
 
     blocked_changed_plugin_ids: Set[str]
     environment_changed: bool
+
+
+@dataclass(frozen=True)
+class AdapterRuntimeTransitionResult:
+    """适配器离线或上线操作的结构化结果。"""
+
+    success: bool
+    changed_plugin_ids: List[str]
+    pending_plugin_ids: List[str]
+    failed_plugins: Dict[str, str]
 
 
 class PluginRuntimeManager(
@@ -116,6 +131,8 @@ class PluginRuntimeManager(
             lambda: self.supervisors,
             hook_spec_registry=self._hook_spec_registry,
         )
+        self._adapter_transition_lock = asyncio.Lock()
+        self._offline_adapter_plugin_ids: Set[str] = set()
 
     async def _dispatch_platform_inbound(self, envelope: InboundMessageEnvelope) -> None:
         """接收 Platform IO 审核后的入站消息并送入主消息链。
@@ -160,11 +177,16 @@ class PluginRuntimeManager(
         return validator.build_plugin_dependency_map(plugin_dirs)
 
     @classmethod
-    def _discover_llm_provider_conflicts(cls, plugin_dirs: Iterable[Path]) -> Dict[str, str]:
+    def _discover_llm_provider_conflicts(
+        cls,
+        plugin_dirs: Iterable[Path],
+        excluded_plugin_ids: Optional[Set[str]] = None,
+    ) -> Dict[str, str]:
         """扫描插件 Manifest，发现 LLM Provider client_type 冲突。
 
         Args:
             plugin_dirs: 需要扫描的插件根目录集合。
+            excluded_plugin_ids: 已因其他原因被隔离、不参与 Provider 冲突判定的插件 ID。
 
         Returns:
             Dict[str, str]: 需要阻止加载的插件 ID 与原因映射。
@@ -174,8 +196,11 @@ class PluginRuntimeManager(
             log_errors=False,
             log_compat_warnings=False,
         )
+        excluded_ids = excluded_plugin_ids or set()
         provider_owners: Dict[str, List[str]] = {}
         for _plugin_path, manifest in validator.iter_plugin_manifests(plugin_dirs, require_entrypoint=True):
+            if manifest.id in excluded_ids:
+                continue
             for client_type in manifest.llm_provider_client_types:
                 provider_owners.setdefault(client_type, []).append(manifest.id)
 
@@ -213,12 +238,25 @@ class PluginRuntimeManager(
         cls,
         builtin_dirs: Sequence[Path],
         third_party_dirs: Sequence[Path],
+        excluded_plugin_ids: Optional[Set[str]] = None,
     ) -> tuple[bool, bool]:
         """返回内置组与第三方组之间的跨 Supervisor 依赖关系。"""
 
         builtin_dependencies = cls._discover_plugin_dependency_map(builtin_dirs)
         third_party_dependencies = cls._discover_plugin_dependency_map(third_party_dirs)
         adapter_plugin_ids = cls._discover_plugin_ids_by_type(third_party_dirs, "adapter")
+        excluded_ids = excluded_plugin_ids or set()
+        builtin_dependencies = {
+            plugin_id: dependencies
+            for plugin_id, dependencies in builtin_dependencies.items()
+            if plugin_id not in excluded_ids
+        }
+        third_party_dependencies = {
+            plugin_id: dependencies
+            for plugin_id, dependencies in third_party_dependencies.items()
+            if plugin_id not in excluded_ids
+        }
+        adapter_plugin_ids.difference_update(excluded_ids)
         builtin_plugin_ids = set(builtin_dependencies)
         third_party_plugin_ids = set(third_party_dependencies)
 
@@ -241,12 +279,14 @@ class PluginRuntimeManager(
         cls,
         builtin_dirs: Sequence[Path],
         third_party_dirs: Sequence[Path],
+        excluded_plugin_ids: Optional[Set[str]] = None,
     ) -> List[str]:
         """根据跨 Supervisor 依赖关系决定 Runner 启动顺序。"""
 
         builtin_needs_third_party, third_party_needs_builtin = cls._get_group_dependency_flags(
             builtin_dirs,
             third_party_dirs,
+            excluded_plugin_ids=excluded_plugin_ids,
         )
 
         if builtin_needs_third_party and third_party_needs_builtin:
@@ -347,11 +387,25 @@ class PluginRuntimeManager(
             DependencySyncState: 同步后的环境变更状态与阻止列表变化集合。
         """
 
-        result = await self._plugin_dependency_pipeline.execute(plugin_dirs)
-        blocked_plugin_reasons = {
-            **result.blocked_plugin_reasons,
-            **self._discover_llm_provider_conflicts(plugin_dirs),
-        }
+        duplicate_plugin_reasons = self._build_duplicate_plugin_block_reasons(plugin_dirs)
+        if duplicate_plugin_reasons:
+            details = "; ".join(
+                f"{plugin_id}: {reason}" for plugin_id, reason in sorted(duplicate_plugin_reasons.items())
+            )
+            logger.error(f"检测到重复插件 ID，冲突插件将被隔离，其余插件继续加载: {details}")
+
+        result = await self._plugin_dependency_pipeline.execute(
+            plugin_dirs,
+            initial_blocked_plugin_reasons=duplicate_plugin_reasons,
+        )
+        blocked_plugin_reasons = dict(result.blocked_plugin_reasons)
+        llm_provider_conflicts = self._discover_llm_provider_conflicts(
+            plugin_dirs,
+            excluded_plugin_ids=set(blocked_plugin_reasons),
+        )
+        for plugin_id, reason in llm_provider_conflicts.items():
+            existing_reason = blocked_plugin_reasons.get(plugin_id)
+            blocked_plugin_reasons[plugin_id] = f"{existing_reason}；{reason}" if existing_reason else reason
         changed_plugin_ids = self._set_blocked_plugin_reasons(blocked_plugin_reasons)
         return DependencySyncState(
             blocked_changed_plugin_ids=changed_plugin_ids,
@@ -413,7 +467,7 @@ class PluginRuntimeManager(
             return False
 
         if not entries:
-            return False
+            return True
 
         allowed_names = {".git", "__pycache__"}
         entry_names = {entry.name for entry in entries}
@@ -468,10 +522,16 @@ class PluginRuntimeManager(
             "builtin": self._builtin_supervisor,
             "third_party": self._third_party_supervisor,
         }
-        start_order = self._build_group_start_order(builtin_dirs, third_party_dirs)
+        excluded_plugin_ids = set(self._blocked_plugin_reasons)
+        start_order = self._build_group_start_order(
+            builtin_dirs,
+            third_party_dirs,
+            excluded_plugin_ids=excluded_plugin_ids,
+        )
         builtin_needs_third_party, third_party_needs_builtin = self._get_group_dependency_flags(
             builtin_dirs,
             third_party_dirs,
+            excluded_plugin_ids=excluded_plugin_ids,
         )
 
         try:
@@ -546,14 +606,6 @@ class PluginRuntimeManager(
 
         builtin_dirs, third_party_dirs = self._resolve_runtime_plugin_dirs()
         self._cleanup_plugin_load_residue_dirs(third_party_dirs)
-        if duplicate_plugin_ids := self._find_duplicate_plugin_ids(builtin_dirs + third_party_dirs):
-            details = "; ".join(
-                f"{plugin_id}: {', '.join(str(path) for path in paths)}"
-                for plugin_id, paths in sorted(duplicate_plugin_ids.items())
-            )
-            logger.error(f"检测到重复插件 ID，拒绝执行 Supervisor 重启: {details}")
-            return False
-
         logger.info(f"开始重启插件运行时 Supervisor: {reason}")
         await self._stop_supervisors()
         self._build_supervisors(builtin_dirs, third_party_dirs)
@@ -582,16 +634,10 @@ class PluginRuntimeManager(
             logger.info("插件运行时已在配置中禁用，跳过启动")
             return
 
+        self._offline_adapter_plugin_ids.clear()
+
         builtin_dirs, third_party_dirs = self._resolve_runtime_plugin_dirs()
         self._cleanup_plugin_load_residue_dirs(third_party_dirs)
-
-        if duplicate_plugin_ids := self._find_duplicate_plugin_ids(builtin_dirs + third_party_dirs):
-            details = "; ".join(
-                f"{plugin_id}: {', '.join(str(p) for p in paths)}"
-                for plugin_id, paths in sorted(duplicate_plugin_ids.items())
-            )
-            logger.error(f"检测到重复插件 ID，拒绝启动插件运行时: {details}")
-            return
 
         if not builtin_dirs and not third_party_dirs:
             logger.info("未找到任何插件目录，跳过插件运行时启动")
@@ -615,7 +661,15 @@ class PluginRuntimeManager(
             config_manager.register_reload_callback(self._config_reload_callback)
             self._config_reload_callback_registered = True
             self._started = True
-            logger.info(f"插件运行时已启动 — 内置: {builtin_dirs or '无'}, 第三方: {third_party_dirs or '无'}")
+            started_group_names = {supervisor.group_name for supervisor in started_supervisors}
+            runtime_descriptions = [
+                description
+                for group_name, description in _RUNTIME_GROUP_DESCRIPTIONS.items()
+                if group_name in started_group_names
+            ]
+            logger.info(
+                f"已启动 {len(started_supervisors)} 个独立插件运行时：{'；'.join(runtime_descriptions)}"
+            )
         except Exception as e:
             logger.error(f"插件运行时启动失败: {e}", exc_info=True)
             await self._stop_plugin_file_watcher()
@@ -672,6 +726,7 @@ class PluginRuntimeManager(
         finally:
             await self._hook_dispatcher.stop()
             self._started = False
+            self._offline_adapter_plugin_ids.clear()
             self._builtin_supervisor = None
             self._third_party_supervisor = None
             self._plugin_path_cache.clear()
@@ -797,12 +852,18 @@ class PluginRuntimeManager(
         statuses: Dict[str, str] = {}
         for supervisor in self.supervisors:
             statuses.update(supervisor.get_plugin_load_statuses())
+        for plugin_id in self._blocked_plugin_reasons:
+            statuses[plugin_id] = "failed"
+        # /offline 是一次临时运行时操作，不会修改插件的 enabled 配置。
+        # 因此已成功卸载的适配器必须保留显式状态，避免 WebUI 将“启用但未加载”误判为加载失败。
+        for plugin_id in self._offline_adapter_plugin_ids:
+            statuses[plugin_id] = "offline"
         return statuses
 
     def get_plugin_load_failure_reasons(self) -> Dict[str, str]:
         """汇总所有 Supervisor 上报的插件加载失败原因。"""
 
-        reasons: Dict[str, str] = {}
+        reasons: Dict[str, str] = dict(self._blocked_plugin_reasons)
         for supervisor in self.supervisors:
             get_reasons = getattr(supervisor, "get_plugin_load_failure_reasons", None)
             if callable(get_reasons):
@@ -953,6 +1014,95 @@ class PluginRuntimeManager(
             success = success and reloaded
 
         return success and not missing_plugin_ids
+
+    def _get_loaded_adapter_plugin_ids(self) -> Set[str]:
+        """返回所有 Supervisor 当前加载的适配器插件 ID。"""
+
+        return {
+            plugin_id
+            for supervisor in self.supervisors
+            for plugin_id in supervisor.get_loaded_plugin_ids_by_type("adapter")
+        }
+
+    async def take_adapters_offline(self) -> AdapterRuntimeTransitionResult:
+        """卸载当前所有适配器插件，并记录可恢复的插件集合。"""
+
+        if not self._started:
+            return AdapterRuntimeTransitionResult(
+                success=False,
+                changed_plugin_ids=[],
+                pending_plugin_ids=sorted(self._offline_adapter_plugin_ids),
+                failed_plugins={"plugin_runtime": "插件运行时尚未启动"},
+            )
+
+        async with self._adapter_transition_lock:
+            unloaded_plugin_ids: Set[str] = set()
+            failed_plugins: Dict[str, str] = {}
+
+            for supervisor in self.supervisors:
+                plugin_ids = supervisor.get_loaded_plugin_ids_by_type("adapter")
+                if not plugin_ids:
+                    continue
+                try:
+                    result = await supervisor.unload_plugins(
+                        plugin_ids,
+                        reason="local_operator_offline",
+                    )
+                except Exception as exc:
+                    failed_plugins.update({plugin_id: str(exc) for plugin_id in plugin_ids})
+                    continue
+                unloaded_plugin_ids.update(result.unloaded_plugins)
+                self._offline_adapter_plugin_ids.update(result.unloaded_plugins)
+                failed_plugins.update(result.failed_plugins)
+
+            return AdapterRuntimeTransitionResult(
+                success=not failed_plugins,
+                changed_plugin_ids=sorted(unloaded_plugin_ids),
+                pending_plugin_ids=sorted(self._offline_adapter_plugin_ids),
+                failed_plugins=failed_plugins,
+            )
+
+    async def bring_adapters_online(self) -> AdapterRuntimeTransitionResult:
+        """重新加载由 ``take_adapters_offline`` 成功卸载的适配器插件。"""
+
+        if not self._started:
+            return AdapterRuntimeTransitionResult(
+                success=False,
+                changed_plugin_ids=[],
+                pending_plugin_ids=sorted(self._offline_adapter_plugin_ids),
+                failed_plugins={"plugin_runtime": "插件运行时尚未启动"},
+            )
+
+        async with self._adapter_transition_lock:
+            requested_plugin_ids = set(self._offline_adapter_plugin_ids)
+            if not requested_plugin_ids:
+                return AdapterRuntimeTransitionResult(
+                    success=True,
+                    changed_plugin_ids=[],
+                    pending_plugin_ids=[],
+                    failed_plugins={},
+                )
+
+            loaded_adapter_plugin_ids = self._get_loaded_adapter_plugin_ids()
+            plugin_ids_to_reload = requested_plugin_ids - loaded_adapter_plugin_ids
+            if plugin_ids_to_reload:
+                await self.reload_plugins_globally(
+                    sorted(plugin_ids_to_reload),
+                    reason="local_operator_online",
+                )
+
+            restored_plugin_ids = requested_plugin_ids & self._get_loaded_adapter_plugin_ids()
+            self._offline_adapter_plugin_ids.difference_update(restored_plugin_ids)
+            failed_plugins = {
+                plugin_id: "适配器插件重新加载失败"
+                for plugin_id in sorted(self._offline_adapter_plugin_ids)
+            }
+            return AdapterRuntimeTransitionResult(
+                success=not failed_plugins,
+                changed_plugin_ids=sorted(restored_plugin_ids),
+                pending_plugin_ids=sorted(self._offline_adapter_plugin_ids),
+                failed_plugins=failed_plugins,
+            )
 
     async def notify_plugin_config_updated(
         self,
@@ -1342,6 +1492,16 @@ class PluginRuntimeManager(
             if len(set(paths)) > 1
         }
 
+    @classmethod
+    def _build_duplicate_plugin_block_reasons(cls, plugin_dirs: Sequence[Path]) -> Dict[str, str]:
+        """为每个重复插件 ID 构建可直接展示给 WebUI 的隔离原因。"""
+
+        duplicate_plugin_ids = cls._find_duplicate_plugin_ids(list(plugin_dirs))
+        return {
+            plugin_id: f"插件 ID 重复，已阻止加载；冲突目录: {', '.join(str(path) for path in paths)}"
+            for plugin_id, paths in sorted(duplicate_plugin_ids.items())
+        }
+
     async def _start_plugin_file_watcher(self) -> None:
         """启动插件文件监视器，并建立源码与配置两类订阅。"""
         if self._plugin_file_watcher is not None and self._plugin_file_watcher.running:
@@ -1626,14 +1786,6 @@ class PluginRuntimeManager(
             return
 
         plugin_dirs = list(self._iter_plugin_dirs())
-        if duplicate_plugin_ids := self._find_duplicate_plugin_ids(plugin_dirs):
-            details = "; ".join(
-                f"{plugin_id}: {', '.join(str(path) for path in paths)}"
-                for plugin_id, paths in sorted(duplicate_plugin_ids.items())
-            )
-            logger.error(f"检测到重复插件 ID，跳过本次插件热重载: {details}")
-            return
-
         relevant_source_changes = [
             change.path.resolve()
             for change in changes

@@ -1,5 +1,5 @@
 import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Link } from '@tanstack/react-router'
+import { Link, useRouterState } from '@tanstack/react-router'
 import {
   Check,
   ChevronLeft,
@@ -7,9 +7,11 @@ import {
   Code2,
   ExternalLink,
   Info,
-  Layout,
   RefreshCw,
   Save,
+  ShieldCheck,
+  SlidersHorizontal,
+  Sparkles,
   X,
 } from 'lucide-react'
 import { parse as parseToml } from 'smol-toml'
@@ -42,6 +44,10 @@ import {
   updateBotConfigRaw,
 } from '@/lib/config-api'
 import { fieldHooks } from '@/lib/field-hooks'
+import {
+  getConfigSearchField,
+  scrollToConfigSearchField,
+} from '@/lib/config-search-navigation'
 import { RestartProvider, useRestart } from '@/lib/restart-context'
 import { cn } from '@/lib/utils'
 
@@ -70,6 +76,8 @@ import {
   RegexRulesHook,
   useAutoSave,
 } from './bot/hooks'
+import { CoreSettings } from './bot/CoreSettings'
+import { CommandPermissions } from './bot/CommandPermissions'
 
 type ConfigSectionData = Record<string, unknown>
 // ==================== 常量定义 ====================
@@ -171,7 +179,7 @@ function BotConfigPageContent() {
   const [saving, setSaving] = useState(false)
   const [autoSaving, setAutoSaving] = useState(false)
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false)
-  const [editMode, setEditMode] = useState<'visual' | 'source'>('visual')
+  const [editMode, setEditMode] = useState<'core' | 'detail' | 'commands' | 'source'>('core')
   const [sourceCode, setSourceCode] = useState<string>('')
   const [hasTomlError, setHasTomlError] = useState(false)
   const [tomlErrorMessage, setTomlErrorMessage] = useState<string>('')
@@ -180,6 +188,8 @@ function BotConfigPageContent() {
   )
   const { toast } = useToast()
   const { triggerRestart, isRestarting } = useRestart()
+  const routeSearch = useRouterState({ select: (state) => state.location.searchStr })
+  const searchFieldPath = useMemo(() => getConfigSearchField(routeSearch), [routeSearch])
 
   const [sectionValues, setSectionValues] = useState<Record<string, ConfigSectionData | null>>({})
 
@@ -318,7 +328,7 @@ function BotConfigPageContent() {
   }, [toast])
 
   // 加载配置
-  const loadConfig = useCallback(async () => {
+  const loadConfig = useCallback(async (): Promise<boolean> => {
     try {
       setLoading(true)
       // 用 allSettled：主配置为必需，schema 为可选，二者失败互不影响
@@ -333,7 +343,7 @@ function BotConfigPageContent() {
           variant: 'destructive',
         })
         setLoading(false)
-        return
+        return false
       }
       parseAndSetConfig(result.value)
       if (schemaResult.status === 'fulfilled' && schemaResult.value) {
@@ -343,6 +353,7 @@ function BotConfigPageContent() {
       }
       setHasUnsavedChanges(false)
       initialLoadRef.current = false
+      return true
     } catch (error) {
       console.error('加载配置失败:', error)
       toast({
@@ -350,13 +361,14 @@ function BotConfigPageContent() {
         description: '无法加载配置文件',
         variant: 'destructive',
       })
+      return false
     } finally {
       setLoading(false)
     }
   }, [toast, parseAndSetConfig])
 
   useEffect(() => {
-    loadConfig()
+    void loadConfig()
   }, [loadConfig])
 
   useEffect(() => {
@@ -400,11 +412,12 @@ function BotConfigPageContent() {
     }
   })
 
-  const { triggerAutoSave, cancelPendingAutoSave } = useAutoSave(
-    initialLoadRef.current,
-    setAutoSaving,
-    setHasUnsavedChanges
-  )
+  const {
+    triggerAutoSave,
+    cancelPendingAutoSave,
+    resetAutoSaveState,
+    runWithAutoSaveBarrier,
+  } = useAutoSave(initialLoadRef.current, setAutoSaving, setHasUnsavedChanges)
 
   const dismissFileModeNotice = useCallback(() => {
     localStorage.setItem(FILE_MODE_NOTICE_DISMISSED_KEY, 'true')
@@ -452,7 +465,9 @@ function BotConfigPageContent() {
         description: '配置已保存',
       })
       // 重新加载可视化配置
-      await loadConfig()
+      if (await loadConfig()) {
+        resetAutoSaveState()
+      }
     } catch (error) {
       setHasTomlError(true)
       const errorMsg = error instanceof Error ? error.message : '保存配置失败'
@@ -468,7 +483,7 @@ function BotConfigPageContent() {
   }
 
   // 处理模式切换
-  const handleModeChange = async (mode: 'visual' | 'source') => {
+  const handleModeChange = async (mode: 'core' | 'detail' | 'commands' | 'source') => {
     if (hasUnsavedChanges) {
       toast({
         variant: 'destructive',
@@ -486,6 +501,7 @@ function BotConfigPageContent() {
       try {
         const result = await getBotConfig()
         parseAndSetConfig(result)
+        resetAutoSaveState()
         setHasUnsavedChanges(false)
       } catch (error) {
         console.error('加载配置失败:', error)
@@ -502,11 +518,8 @@ function BotConfigPageContent() {
   const saveConfig = async () => {
     try {
       setSaving(true)
-      // 取消待处理的自动保存
-      cancelPendingAutoSave()
-
-      await updateBotConfig(buildFullConfig())
-      setHasUnsavedChanges(false)
+      const configToSave = buildFullConfig()
+      await runWithAutoSaveBarrier(() => updateBotConfig(configToSave))
       toast({
         title: '保存成功',
         description: '麦麦设置已保存',
@@ -524,12 +537,15 @@ function BotConfigPageContent() {
   }
 
   const handleReloadFromFile = async () => {
-    cancelPendingAutoSave()
-    await loadConfig()
+    await cancelPendingAutoSave()
+    const loaded = await loadConfig()
+    if (!loaded) {
+      return
+    }
+    resetAutoSaveState()
     if (editMode === 'source') {
       await loadSourceCode()
     }
-    setHasUnsavedChanges(false)
     toast({
       title: '已刷新',
       description: '已从 bot_config.toml 重新读取配置',
@@ -545,11 +561,8 @@ function BotConfigPageContent() {
   const handleSaveAndRestart = async () => {
     try {
       setSaving(true)
-      // 取消待处理的自动保存
-      cancelPendingAutoSave()
-
-      await updateBotConfig(buildFullConfig())
-      setHasUnsavedChanges(false)
+      const configToSave = buildFullConfig()
+      await runWithAutoSaveBarrier(() => updateBotConfig(configToSave))
       toast({
         title: '保存成功',
         description: '配置已保存，即将重启麦麦...',
@@ -576,6 +589,15 @@ function BotConfigPageContent() {
     if (!configSchema) return []
     return buildTabGroupsFromSchema(configSchema)
   }, [configSchema])
+
+  useEffect(() => {
+    if (!searchFieldPath) {
+      return
+    }
+
+    const frameId = window.requestAnimationFrame(() => setEditMode('detail'))
+    return () => window.cancelAnimationFrame(frameId)
+  }, [searchFieldPath])
 
   const setSectionValue = useCallback((sectionName: string, value: ConfigSectionData) => {
     setSectionValues((current) => ({
@@ -610,17 +632,25 @@ function BotConfigPageContent() {
             <div className="flex w-full min-w-0 flex-wrap gap-2 sm:w-auto sm:flex-shrink-0 sm:justify-end">
               <Tabs
                 value={editMode}
-                onValueChange={(v) => handleModeChange(v as 'visual' | 'source')}
-                className="w-full min-w-0 sm:w-[14rem]"
+                onValueChange={(v) => handleModeChange(v as 'core' | 'detail' | 'commands' | 'source')}
+                className="w-full min-w-0 sm:w-[30rem]"
               >
-                <TabsList data-config-bot-mode-tabs="true" className="grid h-9 w-full grid-cols-2">
-                  <TabsTrigger value="visual" className="px-2 text-sm">
-                    <Layout className="mr-1 h-4 w-4" />
-                    可视化
+                <TabsList data-config-bot-mode-tabs="true" className="grid h-9 w-full grid-cols-4">
+                  <TabsTrigger value="core" className="px-2 text-sm">
+                    <Sparkles className="mr-1 h-4 w-4" />
+                    核心设置
+                  </TabsTrigger>
+                  <TabsTrigger value="detail" className="px-2 text-sm">
+                    <SlidersHorizontal className="mr-1 h-4 w-4" />
+                    详细设置
+                  </TabsTrigger>
+                  <TabsTrigger value="commands" className="px-2 text-sm">
+                    <ShieldCheck className="mr-1 h-4 w-4" />
+                    命令管理
                   </TabsTrigger>
                   <TabsTrigger value="source" className="px-2 text-sm">
                     <Code2 className="mr-1 h-4 w-4" />
-                    文件
+                    源文件
                   </TabsTrigger>
                 </TabsList>
               </Tabs>
@@ -636,7 +666,7 @@ function BotConfigPageContent() {
                 <RefreshCw className="h-4 w-4" />
               </Button>
               <Button
-                onClick={editMode === 'visual' ? saveConfig : saveSourceCode}
+                onClick={editMode === 'source' ? saveSourceCode : saveConfig}
                 disabled={saving || autoSaving || !hasUnsavedChanges || isRestarting}
                 size="sm"
                 variant="outline"
@@ -731,14 +761,37 @@ function BotConfigPageContent() {
           </div>
         )}
 
-        {/* 可视化模式 */}
-        {editMode === 'visual' && (
+        {/* 核心设置模式 */}
+        {editMode === 'core' && (
+          <CoreSettings
+            botSection={sectionValues.bot ?? null}
+            personalitySection={sectionValues.personality ?? null}
+            onPersonalitySectionChange={(value) => {
+              setSectionValue('personality', value)
+              setHasUnsavedChanges(true)
+            }}
+          />
+        )}
+
+        {/* 详细设置模式（原可视化模式） */}
+        {editMode === 'detail' && (
           <DynamicConfigTabs
             configSchema={configSchema}
             tabGroups={tabGroups}
             sectionValues={sectionValues}
             setSectionValue={setSectionValue}
             setHasUnsavedChanges={setHasUnsavedChanges}
+            searchFieldPath={searchFieldPath}
+          />
+        )}
+
+        {editMode === 'commands' && (
+          <CommandPermissions
+            pluginSection={sectionValues.plugin ?? null}
+            onChange={(value) => {
+              setSectionValue('plugin', value)
+              setHasUnsavedChanges(true)
+            }}
           />
         )}
 
@@ -786,10 +839,18 @@ interface DynamicConfigTabsProps {
   sectionValues: Record<string, ConfigSectionData | null>
   setSectionValue: (sectionName: string, value: ConfigSectionData) => void
   setHasUnsavedChanges: (v: boolean) => void
+  searchFieldPath: string
 }
 
 function DynamicConfigTabs(props: DynamicConfigTabsProps) {
-  const { configSchema, sectionValues, setHasUnsavedChanges, setSectionValue, tabGroups } = props
+  const {
+    configSchema,
+    searchFieldPath,
+    sectionValues,
+    setHasUnsavedChanges,
+    setSectionValue,
+    tabGroups,
+  } = props
   const initialActiveTab = tabGroups[0]?.id ?? ''
   const [expanded, setExpanded] = useState(false)
   const [activeTab, setActiveTab] = useState(initialActiveTab)
@@ -804,12 +865,70 @@ function DynamicConfigTabs(props: DynamicConfigTabsProps) {
       initialActiveTab === 'experimental' &&
       localStorage.getItem(EXPERIMENTAL_FEATURES_NOTICE_DISMISSED_KEY) !== 'true'
   )
+  const scrolledSearchFieldRef = useRef('')
+
+  if (!tabGroups.some((tab) => tab.id === activeTab)) {
+    const fallbackTab = tabGroups[0]?.id ?? ''
+    if (activeTab !== fallbackTab) {
+      setActiveTab(fallbackTab)
+    }
+  }
 
   useEffect(() => {
-    if (!tabGroups.some((tab) => tab.id === activeTab)) {
-      setActiveTab(tabGroups[0]?.id ?? '')
+    if (!searchFieldPath) {
+      return
     }
-  }, [activeTab, tabGroups])
+
+    const [sectionName, subcategoryName] = searchFieldPath.split('.')
+    const targetTab = tabGroups.find((tab) => tab.sections.includes(sectionName))
+    if (!targetTab) {
+      return
+    }
+
+    const frameId = window.requestAnimationFrame(() => {
+      setActiveTab(targetTab.id)
+      setAdvancedVisible(true)
+      if (targetTab.advanced) {
+        setExpanded(true)
+      }
+
+      if (subcategoryName) {
+        const subtabId = `${sectionName}.${subcategoryName}`
+        setActiveSubtabByGroup((current) => ({
+          ...current,
+          [targetTab.id]: subtabId,
+        }))
+        setExpandedSubtabGroups((current) => ({
+          ...current,
+          [targetTab.id]: true,
+        }))
+      }
+    })
+
+    return () => window.cancelAnimationFrame(frameId)
+  }, [searchFieldPath, tabGroups])
+
+  useEffect(() => {
+    if (!searchFieldPath || scrolledSearchFieldRef.current === searchFieldPath) {
+      return
+    }
+
+    let nestedFrameId = 0
+    const frameId = window.requestAnimationFrame(() => {
+      nestedFrameId = window.requestAnimationFrame(() => {
+        if (scrollToConfigSearchField(searchFieldPath)) {
+          scrolledSearchFieldRef.current = searchFieldPath
+        }
+      })
+    })
+
+    return () => {
+      window.cancelAnimationFrame(frameId)
+      if (nestedFrameId) {
+        window.cancelAnimationFrame(nestedFrameId)
+      }
+    }
+  }, [activeSubtabByGroup, activeTab, advancedVisible, expanded, searchFieldPath])
 
   if (tabGroups.length === 0 || !configSchema?.nested) {
     return null

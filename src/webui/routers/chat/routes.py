@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -80,6 +80,28 @@ class AdapterPolicyUpdateRequest(BaseModel):
     action: str = Field(default="")
 
 
+class AdapterPolicyDefaultsUpdateRequest(BaseModel):
+    """适配器全局默认放行策略编辑请求。"""
+
+    group: Literal["allow", "block"] = Field(default="allow")
+    private: Literal["allow", "block"] = Field(default="allow")
+
+
+class AdapterHostPolicySectionRequest(BaseModel):
+    """单类聊天的主程序适配器放行规则。"""
+
+    default_action: Literal["inherit", "allow", "block"] = Field(default="inherit")
+    allow_ids: List[str] = Field(default_factory=list)
+    deny_ids: List[str] = Field(default_factory=list)
+
+
+class AdapterHostPolicyUpdateRequest(BaseModel):
+    """按适配器插件编辑主程序放行规则的请求。"""
+
+    group: AdapterHostPolicySectionRequest = Field(default_factory=AdapterHostPolicySectionRequest)
+    private: AdapterHostPolicySectionRequest = Field(default_factory=AdapterHostPolicySectionRequest)
+
+
 class ChatTargetResolveItem(BaseModel):
     """配置目标解析请求项。"""
 
@@ -115,13 +137,17 @@ def _get_chat_target_id(chat_session: ChatSession) -> str:
 def _get_chat_display_name(chat_session: ChatSession, latest_message: Optional[Any]) -> str:
     """优先展示聊天流实际名称，缺失时再退回到可读的 ID 名称。"""
 
-    if latest_message:
-        group_name = str(latest_message.group_name or "").strip()
-        if latest_message.group_id and group_name:
-            return group_name
-        if latest_message.group_id:
-            return f"群聊{latest_message.group_id}"
+    if chat_session.group_id:
+        # 群聊会话只能使用仍带群聊身份的消息补齐名称，避免发送侧消息缺少群信息时显示成私聊。
+        if latest_message and latest_message.group_id:
+            group_name = str(latest_message.group_name or "").strip()
+            if group_name:
+                return group_name
+        if chat_session.group_name:
+            return chat_session.group_name
+        return f"群聊{chat_session.group_id}"
 
+    if latest_message and not latest_message.group_id:
         private_name = str(
             latest_message.user_cardname
             or latest_message.user_nickname
@@ -129,11 +155,6 @@ def _get_chat_display_name(chat_session: ChatSession, latest_message: Optional[A
         ).strip()
         if private_name:
             return f"{private_name}的私聊"
-
-    if chat_session.group_name:
-        return chat_session.group_name
-    if chat_session.group_id:
-        return f"群聊{chat_session.group_id}"
 
     private_name = chat_session.user_cardname or chat_session.user_nickname or (
         f"用户{chat_session.user_id}" if chat_session.user_id else ""
@@ -1115,6 +1136,22 @@ def _delete_chat_session_scope(session_id: str) -> Dict[str, Any]:
         items: List[Dict[str, Any]] = []
         total_deleted = 0
 
+        removed_adapter_policy_count = get_adapter_policy_manager().remove_chat_overrides(
+            chat_type=_get_chat_type(chat_session),
+            target_id=_get_chat_target_id(chat_session),
+            platform=str(chat_session.platform or "").strip(),
+            account_id=str(chat_session.account_id or "").strip() or None,
+            scope=str(chat_session.scope or "").strip() or None,
+        )
+        if removed_adapter_policy_count:
+            items.append(
+                {
+                    "key": "adapter_policy_overrides",
+                    "label": "适配器显式放行规则",
+                    "count": removed_adapter_policy_count,
+                }
+            )
+
         jargon_result = _delete_or_unlink_jargons(session, session_id)
         if jargon_result["deleted"] or jargon_result["unlinked"]:
             items.append(
@@ -1431,6 +1468,74 @@ async def update_chat_session_adapter_policy(
 
     await _save_adapter_policy_rule(chat_session, request)
     return {"success": True, "detail": _chat_session_detail_to_response(chat_session)}
+
+
+@router.get("/adapters/policy/defaults")
+async def get_adapter_policy_defaults() -> Dict[str, object]:
+    """返回群聊和私聊的适配器全局默认动作。"""
+
+    return {"success": True, "defaults": get_adapter_policy_manager().get_default_actions()}
+
+
+@router.put("/adapters/policy/defaults")
+async def update_adapter_policy_defaults(request: AdapterPolicyDefaultsUpdateRequest) -> Dict[str, object]:
+    """更新群聊和私聊的适配器全局默认动作。"""
+
+    manager = get_adapter_policy_manager()
+    try:
+        manager.set_default_action("group", request.group)
+        manager.set_default_action("private", request.private)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "defaults": manager.get_default_actions()}
+
+
+@router.get("/adapters/plugins/{plugin_id}/policy")
+async def get_adapter_plugin_policy(plugin_id: str) -> Dict[str, object]:
+    """返回指定适配器插件在主程序侧的群聊与私聊规则。"""
+
+    normalized_plugin_id = str(plugin_id or "").strip()
+    if not normalized_plugin_id:
+        raise HTTPException(status_code=400, detail="缺少适配器插件 ID")
+
+    manager = get_adapter_policy_manager()
+    try:
+        policy = manager.get_adapter_policy(AdapterIdentity(plugin_id=normalized_plugin_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "success": True,
+        "plugin_id": normalized_plugin_id,
+        "global_defaults": manager.get_default_actions(),
+        "policy": policy,
+    }
+
+
+@router.put("/adapters/plugins/{plugin_id}/policy")
+async def update_adapter_plugin_policy(
+    plugin_id: str,
+    request: AdapterHostPolicyUpdateRequest,
+) -> Dict[str, object]:
+    """更新指定适配器插件在主程序侧的群聊与私聊规则。"""
+
+    normalized_plugin_id = str(plugin_id or "").strip()
+    if not normalized_plugin_id:
+        raise HTTPException(status_code=400, detail="缺少适配器插件 ID")
+
+    manager = get_adapter_policy_manager()
+    try:
+        manager.set_adapter_policy(
+            AdapterIdentity(plugin_id=normalized_plugin_id),
+            request.model_dump(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "success": True,
+        "plugin_id": normalized_plugin_id,
+        "global_defaults": manager.get_default_actions(),
+        "policy": manager.get_adapter_policy(AdapterIdentity(plugin_id=normalized_plugin_id)),
+    }
 
 
 @router.delete("/sessions/{session_id}/prompts/{index}")

@@ -64,6 +64,7 @@ def _serialize_component_entry(component: ComponentEntry) -> Dict[str, Any]:
     elif isinstance(component, CommandEntry):
         data["pattern"] = str(component.metadata.get("command_pattern", "") or "")
         data["aliases"] = list(component.aliases)
+        data["permission"] = str(component.metadata.get("permission", "public") or "public")
 
     return data
 
@@ -146,6 +147,7 @@ def _serialize_home_card_entry(component: HomeCardEntry) -> Dict[str, Any]:
         "name": component.name,
         "plugin_id": component.plugin_id,
         "title": _truncate_text(metadata.get("title", component.title), MAX_HOME_CARD_SHORT_TEXT_LENGTH),
+        "show_title": metadata.get("show_title") is not False,
         "description": _truncate_text(metadata.get("description", component.description), 300),
         "content": _sanitize_home_card_content(metadata.get("content", "")),
         "link_url": _sanitize_home_card_link(metadata.get("link_url", "")),
@@ -172,6 +174,38 @@ async def list_plugin_components(plugin_id: str, maibot_session: Optional[str] =
             components.append(_serialize_component_entry(component))
 
     return {"success": True, "components": components}
+
+
+@router.get("/runtime/commands")
+async def list_runtime_commands(maibot_session: Optional[str] = Cookie(None)) -> Dict[str, Any]:
+    """返回当前注册的命令及其插件归属，供统一权限管理页面使用。"""
+
+    require_plugin_token(maibot_session)
+    commands: List[Dict[str, Any]] = [
+        {
+            "id": "core.clear",
+            "name": "clear",
+            "description": "清空当前聊天的 Maisaka 历史上下文",
+            "plugin_name": "MaiBot 核心",
+            "pattern": "^/clear$",
+            "aliases": [],
+            "permission": "operator",
+            "enabled": True,
+        }
+    ]
+    for supervisor in component_query_service._iter_supervisors():
+        for component in supervisor.component_registry.get_components_by_type(
+            ComponentTypes.COMMAND.value,
+            enabled_only=False,
+        ):
+            if not isinstance(component, CommandEntry):
+                continue
+            command = _serialize_component_entry(component)
+            command["id"] = f"{component.plugin_id}.{component.name}"
+            commands.append(command)
+
+    commands.sort(key=lambda command: (str(command["plugin_name"]), str(command["name"])))
+    return {"success": True, "commands": commands}
 
 
 @router.get("/runtime/home-cards")

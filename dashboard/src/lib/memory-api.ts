@@ -230,7 +230,14 @@ export interface MemoryRuntimeConfigPayload {
   vector_pools?: MemoryVectorPoolsStatus
   vector_pools_ready?: boolean
   vector_pools_effective_mode?: string
+  memory_enabled?: boolean
   runtime_ready: boolean
+  retrieval_ready?: boolean
+  degraded?: boolean
+  retrieval_mode?: string
+  available_channels?: string[]
+  unavailable_channels?: string[]
+  vector_health?: MemoryVectorHealth
   embedding_degraded: boolean
   embedding_degraded_reason: string
   embedding_degraded_since?: number | null
@@ -239,6 +246,17 @@ export interface MemoryRuntimeConfigPayload {
   paragraph_vector_backfill_running: number
   paragraph_vector_backfill_failed: number
   paragraph_vector_backfill_done: number
+}
+
+export interface MemoryVectorHealth {
+  state: string
+  error_code?: string
+  reason?: string
+  trusted_coverage?: number
+  recovery_stage?: string
+  operation_id?: string
+  copy_progress?: Record<string, unknown>
+  updated_at?: number | null
 }
 
 export interface MemoryRuntimeSelfCheckPayload {
@@ -314,6 +332,7 @@ export interface MemoryTaskListPayload {
 }
 
 export type MemoryImportInputMode = 'text' | 'json'
+export type MemoryImportCancelOrigin = 'user_request' | 'runtime_shutdown' | 'parent_cancel'
 
 export type MemoryImportTaskKind =
   | 'upload'
@@ -342,8 +361,6 @@ export interface MemoryImportSettings {
   maibot_target_data_dir?: string
   path_aliases?: Record<string, string>
   llm_retry?: Record<string, number>
-  convert_enable_staging_switch?: boolean
-  convert_keep_backup_count?: number
 }
 
 export interface MemoryImportSettingsPayload {
@@ -405,7 +422,10 @@ export interface MemoryTimelineEventPayload {
 
 export interface MemoryTimelinePayload {
   success: boolean
-  chat: Pick<MemoryImportChatTargetPayload, 'chat_id' | 'chat_name' | 'platform' | 'group_id' | 'user_id' | 'is_group'>
+  chat: Pick<
+    MemoryImportChatTargetPayload,
+    'chat_id' | 'chat_name' | 'platform' | 'group_id' | 'user_id' | 'account_id' | 'is_group'
+  >
   range: {
     time_start?: number | null
     time_end?: number | null
@@ -498,6 +518,8 @@ export interface MemoryImportTaskPayload extends MemoryTaskPayload {
   rollback_info?: Record<string, unknown>
   retry_parent_task_id?: string
   retry_summary?: MemoryImportRetrySummary
+  cancel_requested_at?: number | null
+  cancel_origin?: MemoryImportCancelOrigin | ''
   params?: Record<string, unknown>
   files?: MemoryImportFilePayload[]
 }
@@ -659,7 +681,11 @@ export interface MemoryCorrectionRollbackRequestPayload {
 
 export type MemoryCorrectionScope = 'person_profile' | 'memory' | (string & {})
 export type MemoryCorrectionTargetType = 'paragraph' | 'relation' | (string & {})
-export type MemoryCorrectionAction = 'mark_superseded' | 'ingest_text' | 'refresh_person_profile' | (string & {})
+export type MemoryCorrectionAction =
+  | 'mark_superseded'
+  | 'ingest_text'
+  | 'refresh_person_profile'
+  | (string & {})
 export type MemoryCorrectionStatus =
   | 'awaiting_confirmation'
   | 'executing'
@@ -1109,8 +1135,8 @@ export interface MemoryEpisodeDetailPayload {
 
 export interface MemoryEpisodeStatusPayload extends Record<string, unknown> {
   success: boolean
-  pending_queue?: number
   counts?: Record<string, number>
+  running?: Array<Record<string, unknown>>
   failed?: Array<Record<string, unknown>>
   error?: string
 }
@@ -1119,6 +1145,12 @@ export interface MemoryEpisodeActionPayload extends Record<string, unknown> {
   success: boolean
   error?: string
   detail?: string
+  processed?: number
+  rebuilt?: number
+  failed?: number
+  unfinished?: number
+  failures?: Array<{ source?: string; error?: string; reason?: string }>
+  unfinished_items?: Array<{ source?: string; error?: string; reason?: string }>
 }
 
 export interface MemoryProfileItemPayload extends Record<string, unknown> {
@@ -1231,7 +1263,7 @@ export async function getMemoryGraph(limit: number = 120): Promise<MemoryGraphPa
 
 export async function getMemoryGraphSearch(
   query: string,
-  limit: number = 50,
+  limit: number = 50
 ): Promise<MemoryGraphSearchPayload> {
   const params = new URLSearchParams({
     query,
@@ -1246,7 +1278,7 @@ export async function getMemoryGraphNodeDetail(
     relationLimit?: number
     paragraphLimit?: number
     evidenceNodeLimit?: number
-  },
+  }
 ): Promise<MemoryGraphNodeDetailPayload> {
   const params = new URLSearchParams({
     node_id: nodeId,
@@ -1263,7 +1295,7 @@ export async function getMemoryGraphEdgeDetail(
   options?: {
     paragraphLimit?: number
     evidenceNodeLimit?: number
-  },
+  }
 ): Promise<MemoryGraphEdgeDetailPayload> {
   const params = new URLSearchParams({
     source,
@@ -1278,17 +1310,19 @@ export async function getMemoryGraphParagraphDetail(
   paragraphHash: string,
   options?: {
     evidenceNodeLimit?: number
-  },
+  }
 ): Promise<MemoryGraphParagraphDetailResponsePayload> {
   const params = new URLSearchParams({
     paragraph_hash: paragraphHash,
     evidence_node_limit: String(options?.evidenceNodeLimit ?? 80),
   })
-  return requestJson<MemoryGraphParagraphDetailResponsePayload>(`/graph/paragraph-detail?${params.toString()}`)
+  return requestJson<MemoryGraphParagraphDetailResponsePayload>(
+    `/graph/paragraph-detail?${params.toString()}`
+  )
 }
 
 export async function previewMemoryDelete(
-  payload: MemoryDeleteRequestPayload,
+  payload: MemoryDeleteRequestPayload
 ): Promise<MemoryDeletePreviewPayload> {
   return requestJson<MemoryDeletePreviewPayload>('/delete/preview', {
     method: 'POST',
@@ -1297,7 +1331,7 @@ export async function previewMemoryDelete(
 }
 
 export async function executeMemoryDelete(
-  payload: MemoryDeleteRequestPayload,
+  payload: MemoryDeleteRequestPayload
 ): Promise<MemoryDeleteExecutePayload> {
   return requestJson<MemoryDeleteExecutePayload>('/delete/execute', {
     method: 'POST',
@@ -1320,7 +1354,7 @@ export async function restoreMemoryDelete(payload: {
 
 export async function getMemoryDeleteOperations(
   limit: number = 20,
-  mode: string = '',
+  mode: string = ''
 ): Promise<MemoryDeleteOperationListPayload> {
   const params = new URLSearchParams({ limit: String(limit) })
   if (mode.trim()) {
@@ -1330,13 +1364,15 @@ export async function getMemoryDeleteOperations(
 }
 
 export async function getMemoryDeleteOperation(
-  operationId: string,
+  operationId: string
 ): Promise<MemoryDeleteOperationDetailPayload> {
-  return requestJson<MemoryDeleteOperationDetailPayload>(`/delete/operations/${encodeURIComponent(operationId)}`)
+  return requestJson<MemoryDeleteOperationDetailPayload>(
+    `/delete/operations/${encodeURIComponent(operationId)}`
+  )
 }
 
 export async function previewMemoryCorrection(
-  payload: MemoryCorrectionRequestPayload,
+  payload: MemoryCorrectionRequestPayload
 ): Promise<MemoryCorrectionPreviewPayload> {
   const body = { ...payload }
   if (body.limit === undefined) {
@@ -1349,7 +1385,7 @@ export async function previewMemoryCorrection(
 }
 
 export async function executeMemoryCorrection(
-  payload: MemoryCorrectionExecuteRequestPayload,
+  payload: MemoryCorrectionExecuteRequestPayload
 ): Promise<MemoryCorrectionExecutePayload> {
   return requestJson<MemoryCorrectionExecutePayload>('/corrections/execute', {
     method: 'POST',
@@ -1357,13 +1393,11 @@ export async function executeMemoryCorrection(
   })
 }
 
-export async function getMemoryCorrectionPlans(
-  options?: {
-    limit?: number
-    status?: string
-    scope?: string
-  },
-): Promise<MemoryCorrectionPlanListPayload> {
+export async function getMemoryCorrectionPlans(options?: {
+  limit?: number
+  status?: string
+  scope?: string
+}): Promise<MemoryCorrectionPlanListPayload> {
   const params = new URLSearchParams({
     limit: String(options?.limit ?? 50),
   })
@@ -1377,29 +1411,32 @@ export async function getMemoryCorrectionPlans(
 }
 
 export async function getMemoryCorrectionPlan(
-  planId: string,
+  planId: string
 ): Promise<MemoryCorrectionPlanDetailPayload> {
-  return requestJson<MemoryCorrectionPlanDetailPayload>(`/corrections/plans/${encodeURIComponent(planId)}`)
+  return requestJson<MemoryCorrectionPlanDetailPayload>(
+    `/corrections/plans/${encodeURIComponent(planId)}`
+  )
 }
 
 export async function rollbackMemoryCorrectionPlan(
   planId: string,
-  payload: MemoryCorrectionRollbackRequestPayload,
+  payload: MemoryCorrectionRollbackRequestPayload
 ): Promise<MemoryCorrectionRollbackPayload> {
-  return requestJson<MemoryCorrectionRollbackPayload>(`/corrections/plans/${encodeURIComponent(planId)}/rollback`, {
-    method: 'POST',
-    body: payload,
-  })
+  return requestJson<MemoryCorrectionRollbackPayload>(
+    `/corrections/plans/${encodeURIComponent(planId)}/rollback`,
+    {
+      method: 'POST',
+      body: payload,
+    }
+  )
 }
 
-export async function getMemoryFeedbackCorrections(
-  options?: {
-    limit?: number
-    status?: string
-    rollbackStatus?: string
-    query?: string
-  },
-): Promise<MemoryFeedbackCorrectionListPayload> {
+export async function getMemoryFeedbackCorrections(options?: {
+  limit?: number
+  status?: string
+  rollbackStatus?: string
+  query?: string
+}): Promise<MemoryFeedbackCorrectionListPayload> {
   const params = new URLSearchParams({
     limit: String(options?.limit ?? 50),
   })
@@ -1412,11 +1449,13 @@ export async function getMemoryFeedbackCorrections(
   if (options?.query?.trim()) {
     params.set('query', options.query.trim())
   }
-  return requestJson<MemoryFeedbackCorrectionListPayload>(`/feedback-corrections?${params.toString()}`)
+  return requestJson<MemoryFeedbackCorrectionListPayload>(
+    `/feedback-corrections?${params.toString()}`
+  )
 }
 
 export async function getMemoryFeedbackCorrection(
-  taskId: number,
+  taskId: number
 ): Promise<MemoryFeedbackCorrectionDetailPayload> {
   return requestJson<MemoryFeedbackCorrectionDetailPayload>(`/feedback-corrections/${taskId}`)
 }
@@ -1426,12 +1465,15 @@ export async function rollbackMemoryFeedbackCorrection(
   payload: {
     requested_by?: string
     reason?: string
-  },
+  }
 ): Promise<MemoryFeedbackCorrectionRollbackPayload> {
-  return requestJson<MemoryFeedbackCorrectionRollbackPayload>(`/feedback-corrections/${taskId}/rollback`, {
-    method: 'POST',
-    body: payload,
-  })
+  return requestJson<MemoryFeedbackCorrectionRollbackPayload>(
+    `/feedback-corrections/${taskId}/rollback`,
+    {
+      method: 'POST',
+      body: payload,
+    }
+  )
 }
 
 export async function getMemorySources(): Promise<MemorySourceListPayload> {
@@ -1504,7 +1546,9 @@ export async function rebuildMemoryEpisodes(payload: {
   })
 }
 
-export async function getMemoryEpisodeStatus(limit: number = 20): Promise<MemoryEpisodeStatusPayload> {
+export async function getMemoryEpisodeStatus(
+  limit: number = 20
+): Promise<MemoryEpisodeStatusPayload> {
   return requestJson<MemoryEpisodeStatusPayload>(`/episodes/status?limit=${limit}`)
 }
 
@@ -1570,10 +1614,15 @@ export async function setMemoryProfileOverride(payload: {
   })
 }
 
-export async function deleteMemoryProfileOverride(personId: string): Promise<MemoryProfileOverridePayload> {
-  return requestJson<MemoryProfileOverridePayload>(`/profiles/override/${encodeURIComponent(personId)}`, {
-    method: 'DELETE',
-  })
+export async function deleteMemoryProfileOverride(
+  personId: string
+): Promise<MemoryProfileOverridePayload> {
+  return requestJson<MemoryProfileOverridePayload>(
+    `/profiles/override/${encodeURIComponent(personId)}`,
+    {
+      method: 'DELETE',
+    }
+  )
 }
 
 export async function getMemoryProfileEvidence(options: {
@@ -1585,7 +1634,9 @@ export async function getMemoryProfileEvidence(options: {
     limit: String(options.limit ?? 12),
     force_refresh: options.forceRefresh ? 'true' : 'false',
   })
-  return requestJson<MemoryProfileEvidencePayload>(`/profiles/${encodeURIComponent(options.personId)}/evidence?${params.toString()}`)
+  return requestJson<MemoryProfileEvidencePayload>(
+    `/profiles/${encodeURIComponent(options.personId)}/evidence?${params.toString()}`
+  )
 }
 
 export async function correctMemoryProfileEvidence(payload: {
@@ -1597,31 +1648,39 @@ export async function correctMemoryProfileEvidence(payload: {
   refresh?: boolean
   limit?: number
 }): Promise<MemoryProfileEvidenceCorrectPayload> {
-  return requestJson<MemoryProfileEvidenceCorrectPayload>(`/profiles/${encodeURIComponent(payload.person_id)}/evidence/correct`, {
-    method: 'POST',
-    body: {
-      evidence_type: payload.evidence_type,
-      hash: payload.hash,
-      requested_by: payload.requested_by ?? 'knowledge_base',
-      reason: payload.reason ?? 'profile_evidence_correction',
-      refresh: payload.refresh ?? true,
-      limit: payload.limit ?? 12,
-    },
-  })
+  return requestJson<MemoryProfileEvidenceCorrectPayload>(
+    `/profiles/${encodeURIComponent(payload.person_id)}/evidence/correct`,
+    {
+      method: 'POST',
+      body: {
+        evidence_type: payload.evidence_type,
+        hash: payload.hash,
+        requested_by: payload.requested_by ?? 'knowledge_base',
+        reason: payload.reason ?? 'profile_evidence_correction',
+        refresh: payload.refresh ?? true,
+        limit: payload.limit ?? 12,
+      },
+    }
+  )
 }
 
 export async function getMemoryRecycleBin(limit: number = 50): Promise<MemoryRecycleBinPayload> {
   return requestJson<MemoryRecycleBinPayload>(`/maintenance/recycle-bin?limit=${limit}`)
 }
 
-function maintainMemory(path: string, payload: { target: string; hours?: number }): Promise<MemoryMaintenanceActionPayload> {
+function maintainMemory(
+  path: string,
+  payload: { target: string; hours?: number }
+): Promise<MemoryMaintenanceActionPayload> {
   return requestJson<MemoryMaintenanceActionPayload>(path, {
     method: 'POST',
     body: payload,
   })
 }
 
-export async function restoreMaintainedMemory(target: string): Promise<MemoryMaintenanceActionPayload> {
+export async function restoreMaintainedMemory(
+  target: string
+): Promise<MemoryMaintenanceActionPayload> {
   return maintainMemory('/maintenance/restore', { target })
 }
 
@@ -1633,8 +1692,14 @@ export async function freezeMemory(target: string): Promise<MemoryMaintenanceAct
   return maintainMemory('/maintenance/freeze', { target })
 }
 
-export async function protectMemory(target: string, hours?: number): Promise<MemoryMaintenanceActionPayload> {
-  return maintainMemory('/maintenance/protect', hours === undefined ? { target } : { target, hours })
+export async function protectMemory(
+  target: string,
+  hours?: number
+): Promise<MemoryMaintenanceActionPayload> {
+  return maintainMemory(
+    '/maintenance/protect',
+    hours === undefined ? { target } : { target, hours }
+  )
 }
 
 export async function getMemoryRuntimeConfig(): Promise<MemoryRuntimeConfigPayload> {
@@ -1647,11 +1712,13 @@ export async function refreshMemoryRuntimeSelfCheck(): Promise<MemoryRuntimeSelf
   })
 }
 
-export async function rebuildMemoryRuntimeVectors(payload: {
-  dry_run?: boolean
-  batch_size?: number
-  include_relations?: boolean | null
-} = {}): Promise<MemoryVectorRebuildPayload> {
+export async function rebuildMemoryRuntimeVectors(
+  payload: {
+    dry_run?: boolean
+    batch_size?: number
+    include_relations?: boolean | null
+  } = {}
+): Promise<MemoryVectorRebuildPayload> {
   return requestJson<MemoryVectorRebuildPayload>('/runtime/vectors/rebuild', {
     method: 'POST',
     body: payload,
@@ -1666,7 +1733,9 @@ export async function getMemoryConfig(): Promise<MemoryConfigPayload> {
   return requestJson<MemoryConfigPayload>('/config')
 }
 
-export async function updateMemoryConfig(config: Record<string, unknown>): Promise<{ success: boolean; message?: string }> {
+export async function updateMemoryConfig(
+  config: Record<string, unknown>
+): Promise<{ success: boolean; message?: string }> {
   return requestJson('/config', {
     method: 'PUT',
     body: { config },
@@ -1677,7 +1746,9 @@ export async function getMemoryConfigRaw(): Promise<MemoryRawConfigPayload> {
   return requestJson<MemoryRawConfigPayload>('/config/raw')
 }
 
-export async function updateMemoryConfigRaw(config: string): Promise<{ success: boolean; message?: string }> {
+export async function updateMemoryConfigRaw(
+  config: string
+): Promise<{ success: boolean; message?: string }> {
   return requestJson('/config/raw', {
     method: 'PUT',
     body: { config },
@@ -1711,13 +1782,18 @@ export async function resolveMemoryImportPath(payload: {
   })
 }
 
-export async function getMemoryImportTasks(limit: number = 20): Promise<MemoryImportTaskListPayload> {
+export async function getMemoryImportTasks(
+  limit: number = 20
+): Promise<MemoryImportTaskListPayload> {
   return requestJson<MemoryImportTaskListPayload>(`/import/tasks?limit=${limit}`)
 }
 
-export async function getMemoryImportTask(taskId: string, includeChunks: boolean = false): Promise<MemoryImportTaskDetailPayload> {
+export async function getMemoryImportTask(
+  taskId: string,
+  includeChunks: boolean = false
+): Promise<MemoryImportTaskDetailPayload> {
   return requestJson<MemoryImportTaskDetailPayload>(
-    `/import/tasks/${encodeURIComponent(taskId)}?include_chunks=${includeChunks ? 'true' : 'false'}`,
+    `/import/tasks/${encodeURIComponent(taskId)}?include_chunks=${includeChunks ? 'true' : 'false'}`
   )
 }
 
@@ -1725,14 +1801,17 @@ export async function getMemoryImportTaskChunks(
   taskId: string,
   fileId: string,
   offset: number = 0,
-  limit: number = 50,
+  limit: number = 50
 ): Promise<MemoryImportChunkListPayload> {
   return requestJson<MemoryImportChunkListPayload>(
-    `/import/tasks/${encodeURIComponent(taskId)}/chunks/${encodeURIComponent(fileId)}?offset=${offset}&limit=${limit}`,
+    `/import/tasks/${encodeURIComponent(taskId)}/chunks/${encodeURIComponent(fileId)}?offset=${offset}&limit=${limit}`
   )
 }
 
-export async function createMemoryUploadImport(files: File[], payload: Record<string, unknown>): Promise<MemoryImportActionPayload> {
+export async function createMemoryUploadImport(
+  files: File[],
+  payload: Record<string, unknown>
+): Promise<MemoryImportActionPayload> {
   const formData = new FormData()
   files.forEach((file) => {
     formData.append('files', file)
@@ -1744,42 +1823,54 @@ export async function createMemoryUploadImport(files: File[], payload: Record<st
   })
 }
 
-export async function createMemoryPasteImport(payload: Record<string, unknown>): Promise<MemoryImportActionPayload> {
+export async function createMemoryPasteImport(
+  payload: Record<string, unknown>
+): Promise<MemoryImportActionPayload> {
   return requestJson<MemoryImportActionPayload>('/import/paste', {
     method: 'POST',
     body: payload,
   })
 }
 
-export async function createMemoryRawScanImport(payload: Record<string, unknown>): Promise<MemoryImportActionPayload> {
+export async function createMemoryRawScanImport(
+  payload: Record<string, unknown>
+): Promise<MemoryImportActionPayload> {
   return requestJson<MemoryImportActionPayload>('/import/raw-scan', {
     method: 'POST',
     body: payload,
   })
 }
 
-export async function createMemoryLpmmOpenieImport(payload: Record<string, unknown>): Promise<MemoryImportActionPayload> {
+export async function createMemoryLpmmOpenieImport(
+  payload: Record<string, unknown>
+): Promise<MemoryImportActionPayload> {
   return requestJson<MemoryImportActionPayload>('/import/lpmm-openie', {
     method: 'POST',
     body: payload,
   })
 }
 
-export async function createMemoryLpmmConvertImport(payload: Record<string, unknown>): Promise<MemoryImportActionPayload> {
+export async function createMemoryLpmmConvertImport(
+  payload: Record<string, unknown>
+): Promise<MemoryImportActionPayload> {
   return requestJson<MemoryImportActionPayload>('/import/lpmm-convert', {
     method: 'POST',
     body: payload,
   })
 }
 
-export async function createMemoryTemporalBackfillImport(payload: Record<string, unknown>): Promise<MemoryImportActionPayload> {
+export async function createMemoryTemporalBackfillImport(
+  payload: Record<string, unknown>
+): Promise<MemoryImportActionPayload> {
   return requestJson<MemoryImportActionPayload>('/import/temporal-backfill', {
     method: 'POST',
     body: payload,
   })
 }
 
-export async function createMemoryMaibotMigrationImport(payload: Record<string, unknown>): Promise<MemoryImportActionPayload> {
+export async function createMemoryMaibotMigrationImport(
+  payload: Record<string, unknown>
+): Promise<MemoryImportActionPayload> {
   return requestJson<MemoryImportActionPayload>('/import/maibot-migration', {
     method: 'POST',
     body: payload,
@@ -1787,21 +1878,27 @@ export async function createMemoryMaibotMigrationImport(payload: Record<string, 
 }
 
 export async function cancelMemoryImportTask(taskId: string): Promise<MemoryImportActionPayload> {
-  return requestJson<MemoryImportActionPayload>(`/import/tasks/${encodeURIComponent(taskId)}/cancel`, {
-    method: 'POST',
-  })
+  return requestJson<MemoryImportActionPayload>(
+    `/import/tasks/${encodeURIComponent(taskId)}/cancel`,
+    {
+      method: 'POST',
+    }
+  )
 }
 
 export async function retryMemoryImportTask(
   taskId: string,
   payload: {
     overrides?: Record<string, unknown>
-  } = {},
+  } = {}
 ): Promise<MemoryImportActionPayload> {
-  return requestJson<MemoryImportActionPayload>(`/import/tasks/${encodeURIComponent(taskId)}/retry`, {
-    method: 'POST',
-    body: payload,
-  })
+  return requestJson<MemoryImportActionPayload>(
+    `/import/tasks/${encodeURIComponent(taskId)}/retry`,
+    {
+      method: 'POST',
+      body: payload,
+    }
+  )
 }
 
 export async function getMemoryTuningProfile(): Promise<MemoryTuningProfilePayload> {
@@ -1812,7 +1909,12 @@ export async function getMemoryTuningTasks(limit: number = 20): Promise<MemoryTa
   return requestJson<MemoryTaskListPayload>(`/retrieval_tuning/tasks?limit=${limit}`)
 }
 
-export async function createMemoryTuningTask(payload: Record<string, unknown>): Promise<{ success: boolean; task?: MemoryTaskPayload }> {
+export async function createMemoryTuningTask(payload: Record<string, unknown>): Promise<{
+  success: boolean
+  task?: MemoryTaskPayload
+  error?: string
+  message?: string
+}> {
   return requestJson('/retrieval_tuning/tasks', {
     method: 'POST',
     body: payload,
@@ -1821,14 +1923,26 @@ export async function createMemoryTuningTask(payload: Record<string, unknown>): 
 
 export async function applyBestMemoryTuningProfile(
   taskId: string,
-  payload: { persist?: boolean; validate?: boolean } = {},
-): Promise<{ success: boolean; error?: string; persisted?: boolean; runtime_rebuilt?: boolean; validation_passed?: boolean }> {
+  payload: { persist?: boolean; validate?: boolean } = {}
+): Promise<{
+  success: boolean
+  error?: string
+  message?: string
+  persisted?: boolean
+  runtime_rebuilt?: boolean
+  validation_passed?: boolean
+}> {
   return requestJson(`/retrieval_tuning/tasks/${encodeURIComponent(taskId)}/apply-best`, {
     method: 'POST',
     body: payload,
   })
 }
 
-export async function getMemoryTuningReport(taskId: string, format: 'md' | 'json' = 'md'): Promise<{ success: boolean; content: string; path: string; error?: string }> {
-  return requestJson(`/retrieval_tuning/tasks/${encodeURIComponent(taskId)}/report?format=${format}`)
+export async function getMemoryTuningReport(
+  taskId: string,
+  format: 'md' | 'json' = 'md'
+): Promise<{ success: boolean; content: string; path: string; error?: string }> {
+  return requestJson(
+    `/retrieval_tuning/tasks/${encodeURIComponent(taskId)}/report?format=${format}`
+  )
 }

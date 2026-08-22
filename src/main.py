@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Any
 from rich.traceback import install
 
 import asyncio
+import sys
 import time
 
 from src.common.i18n import t
@@ -129,8 +130,10 @@ class MainSystem:
         await _wait_for_plugin_runners_spawned(plugin_runtime_manager, plugin_runtime_task)
 
         from src.A_memorix.host_service import a_memorix_host_service
+        from src.mcp_module.service import get_mcp_service
 
         a_memorix_host_service.register_config_reload_callback()
+        get_mcp_service().register_config_reload_callback()
         a_memorix_task = asyncio.create_task(a_memorix_host_service.start(), name="a_memorix_start")
 
         await asyncio.sleep(0)
@@ -226,6 +229,14 @@ class MainSystem:
                 self.app.run(),
                 self.server.run(),
             ]
+            if global_config.debug.enable_console_input:
+                if sys.stdin.isatty():
+                    from src.cli.bot_console import BotConsole
+
+                    logger.info("已启用终端输入，可输入普通消息或 /clear、/pm 等指令；输入 exit() 关闭终端输入")
+                    tasks.append(BotConsole().run())
+                else:
+                    logger.warning("终端输入已配置为启用，但当前 stdin 不是交互式终端，已跳过")
             image_path_maintenance_needed = await asyncio.to_thread(should_schedule_image_path_maintenance_background)
             if image_path_maintenance_needed:
                 tasks.append(run_image_path_maintenance_background())
@@ -248,6 +259,7 @@ async def main() -> None:
             await system.webui_server.shutdown()
         from src.A_memorix.host_service import a_memorix_host_service
         from src.emoji_system.emoji_manager import emoji_manager
+        from src.mcp_module.service import get_mcp_service
         from src.plugin_runtime.integration import get_plugin_runtime_manager
         from src.services.memory_flow_service import memory_automation_service
 
@@ -257,6 +269,7 @@ async def main() -> None:
         await get_plugin_runtime_manager().bridge_event("on_stop")
         await get_plugin_runtime_manager().stop()
         await async_task_manager.stop_and_wait_all_tasks()
+        await get_mcp_service().close()
         await config_manager.stop_file_watcher()
         set_main_loop(None)
 

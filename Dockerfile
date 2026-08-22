@@ -22,7 +22,7 @@ RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debia
 COPY pyproject.toml uv.lock ./
 
 # Install runtime dependencies
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --no-dev --no-install-project
 
 # Install system libraries required by Playwright Chromium. The browser binary
 # itself is downloaded lazily into the configured data directory at runtime.

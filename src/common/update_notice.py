@@ -19,6 +19,7 @@ _DATA_DIR = PROJECT_ROOT / "data"
 _STATE_PATH = _DATA_DIR / "update_notice_state.json"
 _CHANGELOG_PATH = PROJECT_ROOT / "changelogs" / "changelog.md"
 _VERSION_HEADING_RE = re.compile(r"^# \[(?P<version>[^\]]+)\](?P<suffix>[^\n]*)$", re.MULTILINE)
+_SECTION_HEADING_RE = re.compile(r"^#{2,6}\s+(?P<title>.+?)\s*$", re.MULTILINE)
 _TERMINAL_NOTICE_REPEAT_COUNT = 3
 _TERMINAL_NOTICE_VERSION_KEY = "terminal_notice_version"
 _TERMINAL_NOTICE_COUNT_KEY = "terminal_notice_count"
@@ -162,6 +163,33 @@ def parse_changelog_entries(changelog_path: Path = _CHANGELOG_PATH) -> list[Chan
     return entries
 
 
+def get_changelog_history(
+    current_version: str,
+    limit: int = 20,
+    changelog_path: Path = _CHANGELOG_PATH,
+    offset: int = 0,
+    before_version: str | None = None,
+    section_heading: str | None = None,
+) -> list[ChangelogEntry]:
+    """读取不高于当前版本的历史更新记录，并按版本从新到旧排列。"""
+
+    entries = [
+        entry
+        for entry in parse_changelog_entries(changelog_path)
+        if not _is_version_newer(entry.version, current_version)
+        and (before_version is None or _is_version_newer(before_version, entry.version))
+        and (
+            section_heading is None
+            or any(
+                section_heading.casefold() in match.group("title").casefold()
+                for match in _SECTION_HEADING_RE.finditer(entry.markdown)
+            )
+        )
+    ]
+    entries.sort(key=lambda entry: _version_key(entry.version), reverse=True)
+    return entries[offset : offset + limit]
+
+
 def build_update_notice(
     from_version: str,
     current_version: str,
@@ -188,6 +216,38 @@ def build_update_notice(
         "未在 `changelogs/changelog.md` 中找到对应版本的更新日志条目。"
     )
     return UpdateNotice(current_version=current_version, from_version=from_version, versions=[], content=content)
+
+
+def build_debug_update_notice(
+    current_version: str,
+    changelog_path: Path = _CHANGELOG_PATH,
+) -> UpdateNotice:
+    """构造用于 WebUI 调试的当前版本公告，并以相邻旧版本作为兼容性检查起点。"""
+
+    entries = [
+        entry
+        for entry in parse_changelog_entries(changelog_path)
+        if not _is_version_newer(entry.version, current_version)
+    ]
+    entries.sort(key=lambda entry: _version_key(entry.version), reverse=True)
+
+    if not entries:
+        return UpdateNotice(
+            current_version=current_version,
+            from_version="0.0.0",
+            versions=[],
+            content=f"# 当前 MaiBot 版本 v{current_version}\n\n未找到可展示的更新日志条目。",
+        )
+
+    latest_entry = entries[0]
+    from_version = entries[1].version if len(entries) > 1 else "0.0.0"
+    content = f"# 当前 MaiBot 版本 v{current_version}\n\n{latest_entry.markdown}"
+    return UpdateNotice(
+        current_version=current_version,
+        from_version=from_version,
+        versions=[latest_entry.version],
+        content=content,
+    )
 
 
 def get_pending_update_notice(
@@ -258,7 +318,7 @@ def mark_update_notice_seen(
     _write_json_state(state, state_path)
 
 
-def emit_terminal_update_notice_if_needed() -> None:
+async def emit_terminal_update_notice_if_needed() -> None:
     notice = get_pending_update_notice("terminal")
     if notice is None:
         return
@@ -269,4 +329,22 @@ def emit_terminal_update_notice_if_needed() -> None:
         f"{notice.content}\n"
         f"{'=' * 48}"
     )
+
+    from src.plugin_runtime.update_compatibility_notice import (
+        collect_update_incompatible_plugins,
+        format_terminal_compatibility_notice,
+    )
+
+    incompatible_plugins = await collect_update_incompatible_plugins(
+        notice.from_version,
+        notice.current_version,
+    )
+    if incompatible_plugins:
+        logger.warning(
+            format_terminal_compatibility_notice(
+                notice.from_version,
+                notice.current_version,
+                incompatible_plugins,
+            )
+        )
     mark_update_notice_seen("terminal", notice.current_version)

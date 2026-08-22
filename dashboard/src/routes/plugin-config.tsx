@@ -35,7 +35,6 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import {
-  Settings,
   AlertCircle,
   AlertTriangle,
   Package,
@@ -76,8 +75,9 @@ import type {
   PluginRuntimeComponentType,
 } from '@/lib/plugin-api'
 import { PluginIcon } from './plugins/PluginIcon'
-import { getPluginTypeLabel } from './plugins/types'
-import { getNestedRecord } from './plugin-config/utils'
+import { getPluginType, getPluginTypeLabel } from './plugins/types'
+import { AdapterHostPolicyPanel } from './plugin-config/AdapterHostPolicyPanel'
+import { getNestedRecord, getPluginMarketplaceRoutePath, isAdapterManagementPath } from './plugin-config/utils'
 import { usePluginList } from './plugin-config/hooks/usePluginList'
 import { usePluginLifecycle } from './plugin-config/hooks/usePluginLifecycle'
 import { usePluginConfigEditor } from './plugin-config/hooks/usePluginConfigEditor'
@@ -510,12 +510,20 @@ function PluginDetailsPanel({
   const [readme, setReadme] = useState('')
   const [readmeLoading, setReadmeLoading] = useState(true)
   const [readmeError, setReadmeError] = useState('')
+  const [loadedPluginId, setLoadedPluginId] = useState(plugin.id)
+  if (loadedPluginId !== plugin.id) {
+    setLoadedPluginId(plugin.id)
+    setComponents([])
+    setComponentsLoading(true)
+    setComponentsError('')
+    setReadme('')
+    setReadmeLoading(true)
+    setReadmeError('')
+  }
 
   useEffect(() => {
     let cancelled = false
 
-    setComponentsLoading(true)
-    setComponentsError('')
     getPluginRuntimeComponents(plugin.id)
       .then((data) => {
         if (!cancelled) {
@@ -541,9 +549,6 @@ function PluginDetailsPanel({
   useEffect(() => {
     let cancelled = false
 
-    setReadmeLoading(true)
-    setReadmeError('')
-    setReadme('')
     getLocalPluginReadme(plugin.id)
       .then((content) => {
         if (!cancelled) {
@@ -975,6 +980,36 @@ function PluginDocumentFloatingPanel({ plugin, onClose }: PluginDocumentFloating
     startDrag(event.clientX, event.clientY)
   }
 
+  const handleDragHandleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const direction = {
+      ArrowDown: { left: 0, top: 1 },
+      ArrowLeft: { left: -1, top: 0 },
+      ArrowRight: { left: 1, top: 0 },
+      ArrowUp: { left: 0, top: -1 },
+    }[event.key]
+    if (!direction) {
+      return
+    }
+
+    event.preventDefault()
+    const panelRect = panelRef.current?.getBoundingClientRect()
+    const panelWidth = panelRect?.width ?? DOCUMENT_PANEL_WIDTH
+    const panelHeight = panelRect?.height ?? DOCUMENT_PANEL_HEIGHT
+    const maxLeft = Math.max(
+      DOCUMENT_PANEL_MARGIN,
+      window.innerWidth - DOCUMENT_PANEL_MARGIN - panelWidth
+    )
+    const maxTop = Math.max(
+      DOCUMENT_PANEL_MARGIN,
+      window.innerHeight - DOCUMENT_PANEL_MARGIN - panelHeight
+    )
+    const step = event.shiftKey ? 24 : 8
+    setPosition((current) => ({
+      left: clampPanelValue(current.left + direction.left * step, DOCUMENT_PANEL_MARGIN, maxLeft),
+      top: clampPanelValue(current.top + direction.top * step, DOCUMENT_PANEL_MARGIN, maxTop),
+    }))
+  }
+
   const content = mode === 'readme' ? readme : changelog
   const panelStyle = {
     left: position.left,
@@ -989,9 +1024,13 @@ function PluginDocumentFloatingPanel({ plugin, onClose }: PluginDocumentFloating
       style={panelStyle}
     >
       <div
+        role="button"
+        tabIndex={0}
+        aria-label="移动插件文档窗口"
         className={`flex touch-none select-none items-center gap-2 border-b bg-muted/70 px-3 py-2 ${
           dragging ? 'cursor-grabbing' : 'cursor-grab'
         }`}
+        onKeyDown={handleDragHandleKeyDown}
         onPointerCancel={endDrag}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
@@ -1166,6 +1205,7 @@ function PluginConfigEditor({ plugin, onBack, initialTab }: PluginConfigEditorPr
     (item): item is { label: string; value: string } =>
       typeof item.value === 'string' && item.value.trim().length > 0
   )
+  const showHostPolicy = isAdapterManagementPath() && getPluginType(plugin) === 'adapter'
 
   return (
     <div className="space-y-4 sm:space-y-6">
@@ -1200,24 +1240,26 @@ function PluginConfigEditor({ plugin, onBack, initialTab }: PluginConfigEditorPr
             <BookOpen className="mr-2 h-4 w-4" />
             打开文档
           </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-8"
-            onClick={() => setEditMode(editMode === 'visual' ? 'source' : 'visual')}
-          >
-            {editMode === 'visual' ? (
-              <>
-                <Code2 className="mr-2 h-4 w-4" />
-                源代码
-              </>
-            ) : (
-              <>
-                <Layout className="mr-2 h-4 w-4" />
-                可视化
-              </>
-            )}
-          </Button>
+          {pluginPageTab !== 'host-policy' && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8"
+              onClick={() => setEditMode(editMode === 'visual' ? 'source' : 'visual')}
+            >
+              {editMode === 'visual' ? (
+                <>
+                  <Code2 className="mr-2 h-4 w-4" />
+                  源代码
+                </>
+              ) : (
+                <>
+                  <Layout className="mr-2 h-4 w-4" />
+                  可视化
+                </>
+              )}
+            </Button>
+          )}
           <div
             data-dashboard-input="true"
             className="border-input flex h-8 items-center gap-2 rounded-md border bg-transparent px-2 text-sm font-medium shadow-sm"
@@ -1229,23 +1271,27 @@ function PluginConfigEditor({ plugin, onBack, initialTab }: PluginConfigEditorPr
             />
             <span className="text-xs">启用</span>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-8"
-            onClick={() => setResetDialogOpen(true)}
-          >
-            <RotateCcw className="mr-2 h-4 w-4" />
-            重置
-          </Button>
-          <Button size="sm" className="h-8" onClick={handleSave} disabled={!hasChanges || saving}>
-            {saving ? (
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-            ) : (
-              <Save className="mr-2 h-4 w-4" />
-            )}
-            保存
-          </Button>
+          {pluginPageTab !== 'host-policy' && (
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8"
+                onClick={() => setResetDialogOpen(true)}
+              >
+                <RotateCcw className="mr-2 h-4 w-4" />
+                重置
+              </Button>
+              <Button size="sm" className="h-8" onClick={handleSave} disabled={!hasChanges || saving}>
+                {saving ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Save className="mr-2 h-4 w-4" />
+                )}
+                保存
+              </Button>
+            </>
+          )}
         </div>
       </div>
 
@@ -1263,10 +1309,11 @@ function PluginConfigEditor({ plugin, onBack, initialTab }: PluginConfigEditorPr
 
       <Tabs
         value={pluginPageTab}
-        onValueChange={(value) => setPluginPageTab(value as 'settings' | 'details')}
+        onValueChange={(value) => setPluginPageTab(value as 'settings' | 'host-policy' | 'details')}
       >
         <TabsList>
           <TabsTrigger value="settings">设置</TabsTrigger>
+          {showHostPolicy && <TabsTrigger value="host-policy">主程序放行规则</TabsTrigger>}
           <TabsTrigger value="details">详情</TabsTrigger>
         </TabsList>
         <TabsContent value="settings" className="mt-4">
@@ -1351,6 +1398,11 @@ function PluginConfigEditor({ plugin, onBack, initialTab }: PluginConfigEditorPr
             </>
           )}
         </TabsContent>
+        {showHostPolicy && (
+          <TabsContent value="host-policy" className="mt-4">
+            <AdapterHostPolicyPanel pluginId={plugin.id} />
+          </TabsContent>
+        )}
         <TabsContent value="details" className="mt-4">
           <PluginDetailsPanel
             plugin={plugin}
@@ -1440,6 +1492,7 @@ export function PluginConfigPage() {
 function PluginConfigPageContent() {
   const { themeConfig } = useTheme()
   const { triggerRestart, isRestarting } = useRestart()
+  const adapterManagement = isAdapterManagementPath()
 
   const {
     plugins,
@@ -1454,6 +1507,7 @@ function PluginConfigPageContent() {
     showUpdateOnly,
     setShowUpdateOnly,
     visiblePlugins,
+    visiblePluginGroups,
     actingPluginId,
     setActingPluginId,
     performTogglePlugin,
@@ -1462,6 +1516,7 @@ function PluginConfigPageContent() {
     getPluginRepositoryUrl,
     isPluginDisabled,
     isPluginLoadFailed,
+    isPluginVersionIncompatible,
     getPluginStatusBarClassName,
     getPluginStatusLabel,
     getPluginStatusMeta,
@@ -1528,6 +1583,7 @@ function PluginConfigPageContent() {
     <>
       <ScrollArea className="h-full">
       <div className="space-y-4 p-4 sm:space-y-6 sm:p-6">
+        {!adapterManagement && (
         <div className="flex flex-nowrap items-center gap-2 sm:gap-3">
           <div className="relative min-w-0 flex-1 basis-0 sm:basis-72">
             <Search className="text-muted-foreground absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2" />
@@ -1574,6 +1630,7 @@ function PluginConfigPageContent() {
             <span className="hidden sm:inline">重启麦麦</span>
           </Button>
         </div>
+        )}
 
         {/* 统计信息 */}
         {isModernDashboardStyle ? (
@@ -1694,14 +1751,42 @@ function PluginConfigPageContent() {
             </div>
           </div>
         ) : (
-          <div className="divide-border/80 divide-y">
-            {visiblePlugins.map((plugin) => {
-              const statusMeta = getPluginStatusMeta(plugin)
+          <div className="space-y-4">
+            {visiblePluginGroups.map((group) => (
+              <section key={group.key} aria-labelledby={`plugin-list-group-${group.key}`}>
+                <div className="text-muted-foreground flex items-center gap-2 border-b px-2 pb-1.5 text-xs font-medium">
+                  <span className={`h-2 w-2 rounded-full ${group.dotClassName}`} aria-hidden="true" />
+                  <h2 id={`plugin-list-group-${group.key}`}>{group.label}</h2>
+                  <span aria-label={`${group.plugins.length} 个插件`}>{group.plugins.length}</span>
+                </div>
+                <div className="divide-border/80 divide-y">
+                  {group.plugins.map((plugin) => {
               const pluginActing = actingPluginId === plugin.id
               const pluginDisabled = isPluginDisabled(plugin)
               const updateState = getPluginUpdateState(plugin)
               const pluginLoadFailed = isPluginLoadFailed(plugin)
+              const pluginVersionIncompatible = isPluginVersionIncompatible(plugin)
+              const pluginNeedsUpdate = pluginVersionIncompatible && updateState.hasUpdate
+              const baseStatusMeta = getPluginStatusMeta(plugin)
+              const statusMeta = pluginVersionIncompatible
+                ? {
+                    ...baseStatusMeta,
+                    label: pluginNeedsUpdate ? '需要更新' : '版本不兼容',
+                  }
+                : baseStatusMeta
               const loadFailureReason = plugin.load_error?.trim() || '运行时未返回具体失败原因'
+              const loadFailureTitle = pluginNeedsUpdate
+                ? '当前插件版本需要更新'
+                : pluginVersionIncompatible
+                  ? '当前插件版本已不兼容'
+                  : '插件加载失败'
+              const loadFailureDescription = pluginVersionIncompatible
+                ? checkingUpdates
+                  ? `已安装 v${plugin.manifest.version} 与当前麦麦版本不兼容，正在检查插件市场更新…`
+                  : pluginNeedsUpdate
+                    ? `已安装 v${plugin.manifest.version}，插件市场已有 v${updateState.latestVersion}，请更新后重试。`
+                    : `已安装 v${plugin.manifest.version} 与当前麦麦版本不兼容，请前往插件市场查看兼容版本。`
+                : `失败原因：${loadFailureReason}`
               return (
                 <div
                   key={plugin.id}
@@ -1767,37 +1852,55 @@ function PluginConfigPageContent() {
                         <div className="flex min-w-0 flex-col gap-2 rounded-md border border-red-200 bg-red-50/80 px-3 py-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-950/25 dark:text-red-300 sm:flex-row sm:items-center">
                           <div className="flex min-w-0 flex-1 items-start gap-1.5">
                             <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                            <span className="min-w-0 line-clamp-2 break-words">
-                              失败原因：{loadFailureReason}
-                            </span>
+                            <div className="min-w-0 space-y-0.5">
+                              <div className="text-sm font-medium">{loadFailureTitle}</div>
+                              <div className="line-clamp-2 break-words">{loadFailureDescription}</div>
+                            </div>
                           </div>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            className="h-7 shrink-0 border-red-300 px-2 text-xs text-red-700 hover:bg-red-100 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950"
-                            onClick={(event) => {
-                              event.stopPropagation()
-                              setLoadFailureDetailPlugin(plugin)
-                            }}
-                          >
-                            查看详情
-                          </Button>
+                          <div className="flex shrink-0 items-center gap-2">
+                            {pluginNeedsUpdate && (
+                              <Button
+                                type="button"
+                                size="sm"
+                                className="h-7 px-2 text-xs"
+                                onClick={(event) => openUpdatePluginDialog(plugin, event)}
+                              >
+                                立即更新
+                              </Button>
+                            )}
+                            {pluginVersionIncompatible && !pluginNeedsUpdate && !checkingUpdates && (
+                              <Button
+                                asChild
+                                variant="outline"
+                                size="sm"
+                                className="h-7 border-red-300 px-2 text-xs text-red-700 hover:bg-red-100 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950"
+                              >
+                                <a
+                                  href={getPluginMarketplaceRoutePath()}
+                                  onClick={(event) => event.stopPropagation()}
+                                >
+                                  前往插件市场
+                                </a>
+                              </Button>
+                            )}
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="h-7 border-red-300 px-2 text-xs text-red-700 hover:bg-red-100 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                setLoadFailureDetailPlugin(plugin)
+                              }}
+                            >
+                              查看详情
+                            </Button>
+                          </div>
                         </div>
                       )}
                     </div>
                   </div>
                   <div className="flex items-center justify-end gap-2 border-t pt-2 sm:flex-shrink-0 sm:border-t-0 sm:pt-0">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-9 w-9 p-0"
-                      title="配置"
-                      aria-label="配置"
-                      onClick={() => openPluginConfig(plugin)}
-                    >
-                      <Settings className="h-4 w-4" />
-                    </Button>
                     <div
                       className="flex h-9 w-9 items-center justify-center"
                       title={pluginDisabled ? '启动插件' : '关闭插件'}
@@ -1815,6 +1918,7 @@ function PluginConfigPageContent() {
                     <Button
                       variant="outline"
                       size="sm"
+                      data-plugin-update-button="true"
                       className="relative h-9 w-9 p-0"
                       disabled={pluginActing || !updateState.canUpdate}
                       title={updateState.title}
@@ -1836,9 +1940,10 @@ function PluginConfigPageContent() {
                       )}
                     </Button>
                     <Button
-                      variant="destructive"
+                      variant="outline"
                       size="sm"
-                      className="h-9 w-9 p-0"
+                      data-plugin-delete-button="true"
+                      className="text-primary h-9 w-9 border-current bg-transparent p-0 shadow-none hover:bg-transparent hover:text-primary/80"
                       disabled={pluginActing}
                       title="删除"
                       aria-label="删除"
@@ -1854,7 +1959,10 @@ function PluginConfigPageContent() {
                   </div>
                 </div>
               )
-            })}
+                  })}
+                </div>
+              </section>
+            ))}
           </div>
         )}
 

@@ -320,7 +320,14 @@ describe('KnowledgeBasePage import workflow', () => {
       },
       vector_pools_ready: true,
       vector_pools_effective_mode: 'dual',
+      memory_enabled: true,
       runtime_ready: true,
+      retrieval_ready: true,
+      degraded: false,
+      retrieval_mode: 'hybrid',
+      available_channels: ['metadata', 'sparse', 'graph', 'vector_read', 'vector_write', 'embedding'],
+      unavailable_channels: [],
+      vector_health: { state: 'healthy' },
       embedding_degraded: false,
       embedding_degraded_reason: '',
       embedding_degraded_since: null,
@@ -408,9 +415,10 @@ describe('KnowledgeBasePage import workflow', () => {
     vi.mocked(memoryApi.getMemoryImportPathAliases).mockResolvedValue({
       success: true,
       path_aliases: {
-        lpmm: 'data/lpmm',
-        plugin_data: 'data/plugins/a-dawn.a-memorix',
-        raw: 'data/raw',
+        converted: 'data/a-memorix/imports/converted',
+        lpmm: 'data/a-memorix/imports/source/lpmm',
+        maibot: 'data/a-memorix/imports/source/maibot',
+        raw: 'data/a-memorix/imports/source/raw',
       },
     })
     vi.mocked(memoryApi.getMemoryImportChatTargets).mockResolvedValue({
@@ -886,8 +894,7 @@ describe('KnowledgeBasePage import workflow', () => {
     })
     vi.mocked(memoryApi.getMemoryEpisodeStatus).mockResolvedValue({
       success: true,
-      pending_queue: 0,
-      counts: {},
+      counts: { pending: 2, running: 1, done: 3, failed: 0, total: 6 },
       failed: [],
     })
     vi.mocked(memoryApi.getMemoryEpisodes).mockResolvedValue({
@@ -1095,6 +1102,44 @@ describe('KnowledgeBasePage import workflow', () => {
     expect(screen.getByText('93.2%')).toBeInTheDocument()
   })
 
+  it('shows vector failure as degraded ready without disabling memory', async () => {
+    vi.mocked(memoryApi.getMemoryRuntimeConfig).mockResolvedValueOnce({
+      success: true,
+      config: { plugin: { enabled: true } },
+      data_dir: 'data/plugins/a-dawn.a-memorix',
+      embedding_dimension: 1024,
+      auto_save: true,
+      relation_vectors_enabled: false,
+      memory_enabled: true,
+      runtime_ready: true,
+      retrieval_ready: true,
+      degraded: true,
+      retrieval_mode: 'sparse_graph',
+      available_channels: ['metadata', 'sparse', 'graph'],
+      unavailable_channels: ['vector_read', 'vector_write', 'embedding'],
+      vector_health: {
+        state: 'unavailable',
+        error_code: 'vector_unclassified_error',
+        reason: '向量文件无法读取',
+      },
+      embedding_degraded: true,
+      embedding_degraded_reason: '向量文件无法读取',
+      paragraph_vector_backfill_pending: 0,
+      paragraph_vector_backfill_running: 0,
+      paragraph_vector_backfill_failed: 0,
+      paragraph_vector_backfill_done: 0,
+    })
+
+    renderPage()
+
+    await waitForConsoleReady()
+
+    expect(screen.getByText('降级就绪')).toBeInTheDocument()
+    expect(screen.getByText('可用通道：元数据、稀疏、图谱')).toBeInTheDocument()
+    expect(screen.getByText('向量不可用')).toBeInTheDocument()
+    expect(screen.queryByText('已停用')).not.toBeInTheDocument()
+  })
+
   it('shows pending ETA while vector pool migration rate is unavailable', async () => {
     vi.mocked(memoryApi.getMemoryRuntimeConfig).mockResolvedValueOnce({
       success: true,
@@ -1293,8 +1338,15 @@ describe('KnowledgeBasePage import workflow', () => {
 
     await waitForConsoleReady()
     await openImportTab()
+    const createButton = screen.getByRole('button', { name: '创建导入任务' })
+    expect(createButton).toBeDisabled()
+    expect(screen.getByRole('status')).toHaveTextContent('请选择资料类别')
+    await user.click(screen.getByRole('combobox', { name: '资料类别' }))
+    await user.click(screen.getByRole('option', { name: '叙事资料' }))
+    expect(createButton).toBeEnabled()
 
     const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    expect(fileInput).toHaveAttribute('accept', '.txt,.md,.json')
     const uploadFiles = [
       new File(['hello'], 'demo.txt', { type: 'text/plain' }),
       new File(['{"name":"mai"}'], 'demo.json', { type: 'application/json' }),
@@ -1341,12 +1393,14 @@ describe('KnowledgeBasePage import workflow', () => {
     await waitFor(() => expect(memoryApi.createMemoryMaibotMigrationImport).toHaveBeenCalledTimes(1))
 
     const [uploadedFiles, uploadPayload] = vi.mocked(memoryApi.createMemoryUploadImport).mock.calls[0]
-    expect(uploadedFiles).toHaveLength(4)
-    expect(uploadedFiles.map((file) => file.name)).toEqual(['demo.txt', 'demo.json', 'demo.csv', 'demo.md'])
+    expect(uploadedFiles).toHaveLength(3)
+    expect(uploadedFiles.map((file) => file.name)).toEqual(['demo.txt', 'demo.json', 'demo.md'])
     expect(uploadPayload).toMatchObject({
       input_mode: 'text',
       llm_enabled: true,
-      strategy_override: 'auto',
+      scope_type: 'global',
+      strategy_override: 'narrative',
+      chat_log: false,
       dedupe_policy: 'content_hash',
     })
   }, 60_000)
@@ -1550,6 +1604,50 @@ describe('KnowledgeBasePage import workflow', () => {
       expect(memoryApi.applyBestMemoryTuningProfile).toHaveBeenCalledWith('tune-1', {
         persist: false,
         validate: true,
+      }),
+    )
+  }, 20_000)
+
+  it('shows business failure when tuning task creation is rejected', async () => {
+    vi.mocked(memoryApi.createMemoryTuningTask).mockResolvedValueOnce({
+      success: false,
+      error: '样本不足',
+    })
+    const user = userEvent.setup()
+    renderPage()
+
+    await waitForConsoleReady()
+    await user.click(screen.getByRole('tab', { name: '调优' }))
+    await screen.findByText('记忆搜索调优')
+    await user.click(screen.getByRole('button', { name: '开始调优' }))
+
+    await waitFor(() =>
+      expect(toastMock).toHaveBeenCalledWith({
+        title: '创建调优任务失败',
+        description: '样本不足',
+        variant: 'destructive',
+      }),
+    )
+  }, 20_000)
+
+  it('shows business failure when applying tuning profile is rejected', async () => {
+    vi.mocked(memoryApi.applyBestMemoryTuningProfile).mockResolvedValueOnce({
+      success: false,
+      error: '独立样本验证未通过',
+    })
+    const user = userEvent.setup()
+    renderPage()
+
+    await waitForConsoleReady()
+    await user.click(screen.getByRole('tab', { name: '调优' }))
+    await screen.findByText('记忆搜索调优')
+    await user.click(screen.getByRole('button', { name: '应用推荐结果' }))
+
+    await waitFor(() =>
+      expect(toastMock).toHaveBeenCalledWith({
+        title: '应用最佳参数失败',
+        description: '独立样本验证未通过',
+        variant: 'destructive',
       }),
     )
   }, 20_000)
@@ -1915,6 +2013,112 @@ describe('KnowledgeBasePage import workflow', () => {
       })),
     )
     await waitFor(() => expect(memoryApi.getMemoryEpisode).toHaveBeenCalledWith('ep-1'))
+  }, 20_000)
+
+  it('submits the explicit Episode source attempt budget', async () => {
+    const user = userEvent.setup()
+    vi.mocked(memoryApi.processMemoryEpisodePending).mockClear()
+    renderPage()
+
+    await waitForConsoleReady()
+    await user.click(screen.getByRole('tab', { name: '情景记忆' }))
+    expect(await screen.findByText('已完成')).toBeInTheDocument()
+
+    const limitInput = screen.getByLabelText('本次处理上限')
+    const attemptInput = screen.getByLabelText('最大尝试次数（含首次）')
+    expect(limitInput).toHaveAttribute('max', '200')
+    expect(attemptInput).toHaveAttribute('max', '20')
+    await user.clear(limitInput)
+    await user.type(limitInput, '7')
+    await user.clear(attemptInput)
+    await user.type(attemptInput, '4')
+    await user.click(screen.getByRole('button', { name: '处理来源重建任务' }))
+
+    await waitFor(() =>
+      expect(memoryApi.processMemoryEpisodePending).toHaveBeenCalledWith({ limit: 7, max_retry: 4 }),
+    )
+    expect(toastMock).toHaveBeenCalledWith(expect.objectContaining({ title: '已处理来源重建任务' }))
+  }, 20_000)
+
+  it('does not replace an invalid Episode attempt budget with the default', async () => {
+    const user = userEvent.setup()
+    vi.mocked(memoryApi.processMemoryEpisodePending).mockClear()
+    renderPage()
+
+    await waitForConsoleReady()
+    await user.click(screen.getByRole('tab', { name: '情景记忆' }))
+    const attemptInput = await screen.findByLabelText('最大尝试次数（含首次）')
+    await user.clear(attemptInput)
+    await user.type(attemptInput, '0')
+    await user.click(screen.getByRole('button', { name: '处理来源重建任务' }))
+
+    expect(memoryApi.processMemoryEpisodePending).not.toHaveBeenCalled()
+    expect(toastMock).toHaveBeenCalledWith(expect.objectContaining({ title: '处理参数无效' }))
+
+    await user.clear(attemptInput)
+    await user.type(attemptInput, '21')
+    await user.click(screen.getByRole('button', { name: '处理来源重建任务' }))
+
+    expect(memoryApi.processMemoryEpisodePending).not.toHaveBeenCalled()
+  }, 20_000)
+
+  it('shows the reason returned for an unfinished Episode source task', async () => {
+    const user = userEvent.setup()
+    vi.mocked(memoryApi.processMemoryEpisodePending).mockResolvedValueOnce({
+      success: false,
+      processed: 1,
+      failed: 0,
+      unfinished: 1,
+      unfinished_items: [{ source: 'chat:group-1', reason: 'not_claimed' }],
+    })
+    renderPage()
+
+    await waitForConsoleReady()
+    await user.click(screen.getByRole('tab', { name: '情景记忆' }))
+    await user.click(screen.getByRole('button', { name: '处理来源重建任务' }))
+
+    await waitFor(() =>
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: '处理来源重建任务失败',
+          description: 'chat:group-1: 本轮未领取到该来源任务',
+        }),
+      ),
+    )
+  }, 20_000)
+
+  it('prefers a real chat stream over WebUI local chat in audit timeline', async () => {
+    const user = userEvent.setup()
+    vi.mocked(memoryApi.getMemoryImportChatTargets).mockResolvedValueOnce({
+      success: true,
+      data: [
+        {
+          chat_id: 'webui-chat',
+          chat_name: 'WebUI用户的私聊',
+          platform: 'webui',
+          group_id: null,
+          user_id: 'webui',
+          is_group: false,
+        },
+        {
+          chat_id: 'chat-1',
+          chat_name: '测试群',
+          platform: 'qq',
+          group_id: '10001',
+          user_id: null,
+          is_group: true,
+        },
+      ],
+    })
+    renderPage()
+
+    await waitForConsoleReady()
+    await user.click(screen.getByRole('tab', { name: '审计时间线' }))
+
+    await waitFor(() =>
+      expect(memoryApi.getMemoryTimeline).toHaveBeenCalledWith(expect.objectContaining({ chatId: 'chat-1' })),
+    )
+    expect(memoryApi.getMemoryTimeline).not.toHaveBeenCalledWith(expect.objectContaining({ chatId: 'webui-chat' }))
   }, 20_000)
 
   it('jumps from paragraph timeline event to graph paragraph detail', async () => {

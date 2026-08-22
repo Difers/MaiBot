@@ -25,7 +25,13 @@ from src.webui.dependencies import require_auth
 
 router = APIRouter(prefix="/memory", tags=["memory"], dependencies=[Depends(require_auth)])
 compat_router = APIRouter(prefix="/api", tags=["memory-compat"], dependencies=[Depends(require_auth)])
-STAGING_ROOT = Path(__file__).resolve().parents[3] / "data" / "memory_upload_staging"
+STAGING_ROOT: Optional[Path] = None
+
+
+def _upload_staging_root() -> Path:
+    if STAGING_ROOT is not None:
+        return STAGING_ROOT
+    return a_memorix_host_service.get_runtime_data_dir() / "imports" / "staging"
 
 
 class NodeRequest(BaseModel):
@@ -117,6 +123,7 @@ class MemoryTimelineChat(BaseModel):
     platform: Optional[str] = None
     group_id: Optional[str] = None
     user_id: Optional[str] = None
+    account_id: Optional[str] = None
     is_group: bool = False
 
 
@@ -312,12 +319,20 @@ def _get_chat_name(chat_session: ChatSession, latest_messages: dict[str, dict[st
             return name
     except Exception:
         pass
-    if name := _get_chat_name_from_latest_message(latest_messages.get(chat_id)):
-        return name
-    if chat_session.group_name:
-        return chat_session.group_name
+
+    latest_message = latest_messages.get(chat_id)
     if chat_session.group_id:
+        # 群聊会话只接受带群聊身份的消息名称，避免缺少群信息的发送侧消息被显示成私聊。
+        if latest_message and str(latest_message.get("group_id") or "").strip():
+            if name := _get_chat_name_from_latest_message(latest_message):
+                return name
+        if chat_session.group_name:
+            return chat_session.group_name
         return f"群聊{chat_session.group_id}"
+
+    if latest_message and not str(latest_message.get("group_id") or "").strip():
+        if name := _get_chat_name_from_latest_message(latest_message):
+            return name
     private_name = chat_session.user_cardname or chat_session.user_nickname or (
         f"用户{chat_session.user_id}" if chat_session.user_id else ""
     )
@@ -521,10 +536,11 @@ def _timeline_chat_from_session(chat_session: ChatSession) -> MemoryTimelineChat
     return MemoryTimelineChat(
         chat_id=chat_id,
         chat_name=_get_chat_name(chat_session, latest_messages),
-        platform=getattr(chat_session, "platform", None),
-        group_id=getattr(chat_session, "group_id", None),
-        user_id=getattr(chat_session, "user_id", None),
-        is_group=bool(getattr(chat_session, "group_id", None)),
+        platform=chat_session.platform,
+        group_id=chat_session.group_id,
+        user_id=chat_session.user_id,
+        account_id=chat_session.account_id,
+        is_group=bool(chat_session.group_id),
     )
 
 
@@ -534,6 +550,9 @@ def _timeline_sources_for_chat(chat_id: str) -> set[str]:
         return set()
     return {
         f"chat_summary:{token}",
+        f"memory:{token}",
+        f"chat_stream:{token}",
+        f"chat_history:{token}",
         f"maibot.chat_history:{token}",
     }
 
@@ -1799,7 +1818,7 @@ async def _episode_status(limit: int) -> dict:
 
 async def _episode_process_pending(payload: EpisodeProcessPendingRequest) -> dict:
     return await memory_service.episode_admin(
-        action="process_pending",
+        action="process_sources",
         limit=payload.limit,
         max_retry=payload.max_retry,
     )
@@ -2068,7 +2087,12 @@ async def _memory_config_get_raw() -> dict:
 
 
 async def _memory_config_update(payload: MemoryConfigUpdateRequest) -> dict:
-    return await a_memorix_host_service.update_config(payload.config)
+    try:
+        return await a_memorix_host_service.update_config(payload.config)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"配置数据验证失败: {exc}") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 async def _memory_config_update_raw(payload: MemoryRawConfigUpdateRequest) -> dict:
@@ -2076,7 +2100,12 @@ async def _memory_config_update_raw(payload: MemoryRawConfigUpdateRequest) -> di
         tomlkit.loads(payload.config)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"TOML 格式错误: {exc}") from exc
-    return await a_memorix_host_service.update_raw_config(payload.config)
+    try:
+        return await a_memorix_host_service.update_raw_config(payload.config)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"配置数据验证失败: {exc}") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 async def _maintenance_recycle_bin(limit: int) -> dict:
@@ -2375,8 +2404,9 @@ async def _tuning_report(task_id: str, fmt: str) -> dict:
 
 
 async def _stage_upload_files(files: list[UploadFile]) -> tuple[Path, list[dict[str, Any]]]:
-    STAGING_ROOT.mkdir(parents=True, exist_ok=True)
-    staging_dir = STAGING_ROOT / uuid.uuid4().hex
+    staging_root = _upload_staging_root()
+    staging_root.mkdir(parents=True, exist_ok=True)
+    staging_dir = staging_root / uuid.uuid4().hex
     staging_dir.mkdir(parents=True, exist_ok=True)
     staged_files: list[dict[str, Any]] = []
     for index, upload in enumerate(files):

@@ -1,6 +1,17 @@
 import { useEffect, useRef, useState, type CSSProperties, type PointerEvent } from 'react'
 
-import { AlertCircle, Check, ChevronDown, ChevronUp, ExternalLink, GripVertical, Plus, Trash2 } from 'lucide-react'
+import {
+  AlertCircle,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  ExternalLink,
+  EyeOff,
+  GripVertical,
+  Plus,
+  RotateCcw,
+  Trash2,
+} from 'lucide-react'
 
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
@@ -36,7 +47,13 @@ import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { fieldTitleClassName } from '@/components/dynamic-form/fieldStyle'
 import { getChatStreams, resolveChatTargets, type ChatStream, type ChatTargetResolveRequest } from '@/lib/chat-management-api'
+import { formatChatDisplayName } from '@/lib/chat-display'
 import { getBotConfigCached } from '@/lib/config-api'
+import {
+  getDiscoveredBotAccounts,
+  setDiscoveredBotAccountDisabled,
+  type BotPlatformAccount,
+} from '@/lib/bot-accounts-api'
 import { useResolvedAvatarUrl } from '@/lib/avatar-url'
 import type { FieldHookComponent } from '@/lib/field-hooks'
 import type { ConfigSchema } from '@/types/config-schema'
@@ -98,7 +115,6 @@ const LEARNING_ITEM_FALLBACK_SCHEMA: ConfigSchema = {
       required: false,
       default: '',
       'x-widget': 'input',
-      'x-icon': 'wifi',
     },
     {
       name: 'item_id',
@@ -112,7 +128,6 @@ const LEARNING_ITEM_FALLBACK_SCHEMA: ConfigSchema = {
       required: false,
       default: '',
       'x-widget': 'input',
-      'x-icon': 'hash',
     },
     {
       name: 'type',
@@ -127,7 +142,6 @@ const LEARNING_ITEM_FALLBACK_SCHEMA: ConfigSchema = {
       default: 'group',
       options: ['group', 'private'],
       'x-widget': 'select',
-      'x-icon': 'users',
       'x-option-descriptions': {
         group: '群聊',
         private: '私聊',
@@ -145,7 +159,6 @@ const LEARNING_ITEM_FALLBACK_SCHEMA: ConfigSchema = {
       required: false,
       default: true,
       'x-widget': 'switch',
-      'x-icon': 'message-square',
     },
     {
       name: 'learn',
@@ -159,7 +172,6 @@ const LEARNING_ITEM_FALLBACK_SCHEMA: ConfigSchema = {
       required: false,
       default: true,
       'x-widget': 'switch',
-      'x-icon': 'graduation-cap',
     },
   ],
 }
@@ -481,7 +493,7 @@ const chatStreamTypeLabel = (chatType: string) => {
 
 const chatStreamSelectLabel = (chat: ChatStream) => {
   const targetId = chatStreamTargetId(chat)
-  const name = chat.display_name || targetId || chat.session_id
+  const name = formatChatDisplayName(chat.display_name || targetId || chat.session_id, chat.account_id)
   return `${name} · ${chatStreamTypeLabel(chat.chat_type)} · ${chat.platform}:${targetId}`
 }
 
@@ -497,7 +509,11 @@ const normalizeSharedMemoryChatStreams = (chats: ChatStream[]) => {
     if (!chat.platform || !targetId || !['group', 'private'].includes(chat.chat_type)) {
       return
     }
-    optionMap.set(chatStreamOptionKey(chat), chat)
+    const optionKey = chatStreamOptionKey(chat)
+    if (!optionMap.has(optionKey)) {
+      // 接口按最近活跃时间倒序返回；保留首条，避免旧版无账号聊天流覆盖当前真实聊天流。
+      optionMap.set(optionKey, chat)
+    }
   })
 
   return Array.from(optionMap.values()).sort((left, right) => {
@@ -751,7 +767,9 @@ function ResolvedChatTargetInfo({ chat }: { chat: ChatStream }) {
         {avatarUrl && <AvatarImage src={avatarUrl} alt={`${chat.display_name} 的头像`} />}
         <AvatarFallback className="text-[10px]">{fallbackText}</AvatarFallback>
       </Avatar>
-      <span className="min-w-0 truncate text-foreground">{chat.display_name}</span>
+      <span className="min-w-0 truncate text-foreground">
+        {formatChatDisplayName(chat.display_name, chat.account_id)}
+      </span>
       <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
         {chat.platform}:{chat.target_id}
       </span>
@@ -914,6 +932,7 @@ function SharedMemoryChatStreamSelect({
     if (!normalizedSearch) return true
     return [
       chat.display_name,
+      chat.account_id,
       chat.platform,
       chatStreamTargetId(chat),
       chatStreamTypeLabel(chat.chat_type),
@@ -1017,7 +1036,7 @@ function SharedMemoryChatStreamSelect({
   )
 }
 
-function SharedMemoryManualFields({
+function ChatTargetFields({
   onChange,
   target,
 }: {
@@ -1068,26 +1087,33 @@ function SharedMemoryManualFields({
   )
 }
 
-function AddGroupTargetDialog({
+function AddTargetScopeDialog<TScopeKind extends string>({
+  description,
+  defaultScope,
   open,
   onAdd,
   onOpenChange,
   scopeOptions,
   title,
 }: {
+  description: string
+  defaultScope: TScopeKind
   open: boolean
-  onAdd: (scopeKind: GroupScopeKind, ruleType: ExpressionRuleType) => void
+  onAdd: (scopeKind: TScopeKind, ruleType: ExpressionRuleType) => void
   onOpenChange: (open: boolean) => void
   scopeOptions: Array<{
     description: string
-    kind: GroupScopeKind
+    kind: TScopeKind
     title: string
   }>
   title: string
 }) {
-  const [selectedScope, setSelectedScope] = useState<GroupScopeKind>('chat')
+  const [selectedScope, setSelectedScope] = useState<TScopeKind>(defaultScope)
   const [ruleType, setRuleType] = useState<ExpressionRuleType>('group')
-  const fallbackScope = scopeOptions.find((option) => option.kind === 'chat')?.kind ?? scopeOptions[0]?.kind ?? 'chat'
+  const fallbackScope = scopeOptions.find((option) => option.kind === defaultScope)?.kind ?? scopeOptions[0]?.kind
+  if (fallbackScope === undefined) {
+    throw new Error('聊天流范围选择器至少需要一个可选范围')
+  }
   const activeScope = scopeOptions.some((option) => option.kind === selectedScope) ? selectedScope : fallbackScope
 
   return (
@@ -1095,6 +1121,7 @@ function AddGroupTargetDialog({
       <DialogContent style={{ '--dialog-width': '44rem' } as CSSProperties}>
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
           <div className="grid gap-2 md:grid-cols-2">
@@ -1140,6 +1167,38 @@ function AddGroupTargetDialog({
   )
 }
 
+const SharedMemoryManualFields = ChatTargetFields
+
+function AddGroupTargetDialog({
+  open,
+  onAdd,
+  onOpenChange,
+  scopeOptions,
+  title,
+}: {
+  open: boolean
+  onAdd: (scopeKind: GroupScopeKind, ruleType: ExpressionRuleType) => void
+  onOpenChange: (open: boolean) => void
+  scopeOptions: Array<{
+    description: string
+    kind: GroupScopeKind
+    title: string
+  }>
+  title: string
+}) {
+  return (
+    <AddTargetScopeDialog
+      defaultScope="chat"
+      description="选择成员作用范围和聊天类型；可选范围由当前配置能力决定。"
+      open={open}
+      onAdd={onAdd}
+      onOpenChange={onOpenChange}
+      scopeOptions={scopeOptions}
+      title={title}
+    />
+  )
+}
+
 function AddLearningRuleDialog({
   open,
   onAdd,
@@ -1149,57 +1208,16 @@ function AddLearningRuleDialog({
   onAdd: (scopeKind: LearningScopeKind, ruleType: ExpressionRuleType) => void
   onOpenChange: (open: boolean) => void
 }) {
-  const [selectedScope, setSelectedScope] = useState<LearningScopeKind>('chat')
-  const [ruleType, setRuleType] = useState<ExpressionRuleType>('group')
-
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent style={{ '--dialog-width': '48rem' } as CSSProperties}>
-        <DialogHeader>
-          <DialogTitle>添加学习规则</DialogTitle>
-          <DialogDescription>选择规则作用范围和聊天类型。添加后范围与类型不可直接修改，需要删除后重新添加。</DialogDescription>
-        </DialogHeader>
-        <div className="space-y-3">
-          <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-            {LEARNING_SCOPE_OPTIONS.map((option) => (
-              <button
-                key={option.kind}
-                type="button"
-                className={`rounded-md border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
-                  selectedScope === option.kind
-                    ? 'border-primary bg-primary text-primary-foreground'
-                    : 'bg-muted/20 hover:bg-muted/40'
-                }`}
-                onClick={() => setSelectedScope(option.kind)}
-              >
-                <span className="block text-sm font-semibold">{option.title}</span>
-                <span className="mt-1 block text-xs leading-5 opacity-75">{option.description}</span>
-              </button>
-            ))}
-          </div>
-          <div className="max-w-40 space-y-1">
-            <Label className="text-[11px] leading-none text-muted-foreground">聊天类型</Label>
-            <Select value={ruleType} onValueChange={(nextRuleType) => setRuleType(normalizeExpressionRuleType(nextRuleType))}>
-              <SelectTrigger className="h-8">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="group">群聊</SelectItem>
-                <SelectItem value="private">私聊</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
-        <DialogFooter>
-          <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-            取消
-          </Button>
-          <Button type="button" onClick={() => onAdd(selectedScope, ruleType)}>
-            添加
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    <AddTargetScopeDialog
+      defaultScope="chat"
+      description="选择规则作用范围和聊天类型。添加后范围与类型不可直接修改，需要删除后重新添加。"
+      open={open}
+      onAdd={onAdd}
+      onOpenChange={onOpenChange}
+      scopeOptions={LEARNING_SCOPE_OPTIONS}
+      title="添加学习规则"
+    />
   )
 }
 
@@ -1453,24 +1471,21 @@ function ExpressionGroupMemberItem({
   const hasSharedMemoryTarget = isSharedMemoryGroup && Boolean(platform && itemId)
   const unmatchedSharedMemoryTarget = isSharedMemoryGroup && hasSharedMemoryTarget && !sharedMemoryChat
   const unmatchedSharedMemoryTargetKey = unmatchedSharedMemoryTarget ? expressionTargetOptionKey(member) : ''
-  const openedUnmatchedTargetKeyRef = useRef(unmatchedSharedMemoryTargetKey)
+  const [openedUnmatchedTargetKey, setOpenedUnmatchedTargetKey] = useState(unmatchedSharedMemoryTargetKey)
   const [manualEditing, setManualEditing] = useState(unmatchedSharedMemoryTarget)
   const showSharedMemoryManualFields = isSharedMemoryGroup && manualEditing
 
-  useEffect(() => {
-    if (!isSharedMemoryGroup) {
-      return
-    }
+  if (isSharedMemoryGroup) {
     if (!unmatchedSharedMemoryTargetKey) {
-      openedUnmatchedTargetKeyRef.current = ''
-      setManualEditing(false)
-      return
-    }
-    if (openedUnmatchedTargetKeyRef.current !== unmatchedSharedMemoryTargetKey) {
-      openedUnmatchedTargetKeyRef.current = unmatchedSharedMemoryTargetKey
+      if (openedUnmatchedTargetKey !== '' || manualEditing) {
+        setOpenedUnmatchedTargetKey('')
+        setManualEditing(false)
+      }
+    } else if (openedUnmatchedTargetKey !== unmatchedSharedMemoryTargetKey) {
+      setOpenedUnmatchedTargetKey(unmatchedSharedMemoryTargetKey)
       setManualEditing(true)
     }
-  }, [isSharedMemoryGroup, unmatchedSharedMemoryTargetKey])
+  }
 
   const updateScopeField = (patch: Partial<ExpressionGroupTarget>) => {
     onUpdateMember(groupIndex, memberIndex, {
@@ -2372,29 +2387,15 @@ function TalkValueRuleEditor({
 }) {
   const [mode, setMode] = useState<TalkValueEditorMode>('timeline')
   const [addDialogOpen, setAddDialogOpen] = useState(false)
-  const [addDraft, setAddDraft] = useState(createEmptyTalkRuleDraft)
-  const canSubmitAddRule = addDraft.platform.trim().length > 0 && addDraft.itemId.trim().length > 0
-
-  const handleAddDialogOpenChange = (open: boolean) => {
-    setAddDialogOpen(open)
-    if (!open) {
-      setAddDraft(createEmptyTalkRuleDraft())
-    }
-  }
-
-  const handleSubmitAddRule = () => {
-    if (!canSubmitAddRule) {
-      return
-    }
-
+  const handleAddRule = (scopeKind: LearningScopeKind, ruleType: ExpressionRuleType) => {
+    const target = buildLearningRulePatch(scopeKind, createEmptyTalkRuleDraft(), [])
     onAddItem({
-      platform: addDraft.platform.trim(),
-      item_id: addDraft.itemId.trim(),
-      rule_type: addDraft.ruleType,
+      ...target,
+      rule_type: ruleType,
       time: '00:00-23:59',
       value: 0.5,
     })
-    handleAddDialogOpenChange(false)
+    setAddDialogOpen(false)
   }
 
   return (
@@ -2428,81 +2429,15 @@ function TalkValueRuleEditor({
           </Button>
         </div>
       </div>
-      <Dialog open={addDialogOpen} onOpenChange={handleAddDialogOpenChange}>
-        <DialogContent className="sm:max-w-md" confirmOnEnter>
-          <DialogHeader>
-            <DialogTitle>添加发言频率规则</DialogTitle>
-            <DialogDescription>
-              先指定平台、聊天流 ID 和聊天类型，再创建该聊天区域的默认时间段轨道。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4">
-            <div className="space-y-2">
-              <Label className="text-xs font-medium">平台</Label>
-              <Input
-                value={addDraft.platform}
-                placeholder="例如 qq"
-                onChange={(event) =>
-                  setAddDraft((current) => ({
-                    ...current,
-                    platform: event.target.value,
-                  }))
-                }
-              />
-            </div>
-            <div className="space-y-2">
-              <Label className="text-xs font-medium">聊天流 ID</Label>
-              <Input
-                value={addDraft.itemId}
-                placeholder="群号或用户 ID"
-                onChange={(event) =>
-                  setAddDraft((current) => ({
-                    ...current,
-                    itemId: event.target.value,
-                  }))
-                }
-              />
-            </div>
-            <div className="space-y-2">
-              <Label className="text-xs font-medium">聊天类型</Label>
-              <Select
-                value={addDraft.ruleType}
-                onValueChange={(value) =>
-                  setAddDraft((current) => ({
-                    ...current,
-                    ruleType: value,
-                  }))
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="group">群聊</SelectItem>
-                  <SelectItem value="private">私聊</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => handleAddDialogOpenChange(false)}
-            >
-              取消
-            </Button>
-            <Button
-              type="button"
-              data-dialog-action="confirm"
-              disabled={!canSubmitAddRule}
-              onClick={handleSubmitAddRule}
-            >
-              添加
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <AddTargetScopeDialog
+        defaultScope="chat"
+        description="选择规则作用范围和聊天类型。添加后可在规则区域继续填写平台、聊天流 ID、时间段和发言频率。"
+        open={addDialogOpen}
+        onAdd={handleAddRule}
+        onOpenChange={setAddDialogOpen}
+        scopeOptions={LEARNING_SCOPE_OPTIONS}
+        title="添加发言频率规则"
+      />
       {mode === 'timeline' ? (
         <TalkValueTimelineOverview
           items={items}
@@ -2778,7 +2713,6 @@ export const ChatPromptsHook = createListItemEditorHook({
       'x-layout': 'inline-right',
     },
   },
-  iconName: 'file-text',
   itemTitle: (item) => {
     return `${platformLabel(item)} · ${ruleTypeLabel(item.rule_type)}`
   },
@@ -2882,6 +2816,12 @@ export const BotPlatformAccountsHook: FieldHookComponent = ({
   parentValues,
   value,
 }) => {
+  const [discoveredAccounts, setDiscoveredAccounts] = useState<BotPlatformAccount[]>([])
+  const [accountsLoading, setAccountsLoading] = useState(true)
+  const [accountsError, setAccountsError] = useState('')
+  const [mutatingAccountId, setMutatingAccountId] = useState<number | null>(null)
+  const [disabledAccountsOpen, setDisabledAccountsOpen] = useState(false)
+  const [fallbackAccountsOpen, setFallbackAccountsOpen] = useState(false)
   const primaryPlatform = typeof value === 'string' ? value : ''
   const qqAccountValue = parentValues?.qq_account
   const qqAccount =
@@ -2890,6 +2830,39 @@ export const BotPlatformAccountsHook: FieldHookComponent = ({
       : ''
   const platforms = normalizePlatformAccounts(parentValues?.platforms)
   const rows = platforms.map(parsePlatformAccount)
+  const activeDiscoveredAccounts = discoveredAccounts.filter((account) => !account.disabled)
+  const disabledDiscoveredAccounts = discoveredAccounts.filter((account) => account.disabled)
+
+  const loadDiscoveredAccounts = async () => {
+    setAccountsLoading(true)
+    setAccountsError('')
+    try {
+      setDiscoveredAccounts(await getDiscoveredBotAccounts())
+    } catch (error) {
+      setAccountsError(error instanceof Error ? error.message : '读取适配器账号失败')
+    } finally {
+      setAccountsLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadDiscoveredAccounts()
+  }, [])
+
+  const toggleDiscoveredAccount = async (account: BotPlatformAccount) => {
+    setMutatingAccountId(account.id)
+    setAccountsError('')
+    try {
+      const updated = await setDiscoveredBotAccountDisabled(account.id, !account.disabled)
+      setDiscoveredAccounts((current) =>
+        current.map((item) => (item.id === updated.id ? updated : item)),
+      )
+    } catch (error) {
+      setAccountsError(error instanceof Error ? error.message : '更新适配器账号失败')
+    } finally {
+      setMutatingAccountId(null)
+    }
+  }
 
   const updateRows = (nextRows: PlatformAccountRow[]) => {
     onParentChange?.('platforms', nextRows.map(formatPlatformAccount))
@@ -2909,49 +2882,153 @@ export const BotPlatformAccountsHook: FieldHookComponent = ({
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between gap-2">
-        <div className="min-w-0 space-y-1">
-          <Label className="text-[15px] font-semibold leading-6">平台账号</Label>
-        </div>
-        <Button
-          type="button"
-          size="icon"
-          variant="outline"
-          className="shrink-0"
-          aria-label="添加平台"
-          title="添加平台"
-          onClick={addRow}
-        >
-          <Plus className="h-4 w-4" />
-        </Button>
+      <div className="space-y-2">
+        <Label className="text-[15px] font-semibold leading-6">适配器已发现账号</Label>
+        {accountsLoading ? (
+          <p className="text-sm text-muted-foreground">正在读取适配器账号…</p>
+        ) : activeDiscoveredAccounts.length === 0 ? (
+          <p className="text-sm text-muted-foreground">尚未收到适配器上报的账号。</p>
+        ) : (
+          <div className="space-y-2">
+            {activeDiscoveredAccounts.map((account) => (
+              <div
+                key={account.id}
+                className="flex flex-wrap items-center justify-between gap-3 rounded-md border bg-muted/20 p-3"
+              >
+                <div className="min-w-0 space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium">{account.platform}</span>
+                    <span className="font-mono text-sm">{account.account_id}</span>
+                    <Badge variant={account.online ? 'default' : 'outline'}>
+                      {account.online ? '在线' : '离线'}
+                    </Badge>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    最近通过 {account.last_source === 'ready' ? '就绪状态' : '入站消息'}上报于{' '}
+                    {new Date(account.last_seen_at).toLocaleString()}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={mutatingAccountId === account.id}
+                  className="text-muted-foreground/45 hover:text-destructive focus-visible:ring-ring inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md transition-colors focus-visible:ring-2 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50"
+                  aria-label="排除身份"
+                  title="排除身份"
+                  onClick={() => void toggleDiscoveredAccount(account)}
+                >
+                  <EyeOff className="h-4 w-4" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        {disabledDiscoveredAccounts.length > 0 && (
+          <div className="border-t pt-2">
+            <button
+              type="button"
+              className="text-muted-foreground hover:text-foreground flex w-full items-center justify-between py-1 text-sm transition-colors"
+              aria-expanded={disabledAccountsOpen}
+              onClick={() => setDisabledAccountsOpen((open) => !open)}
+            >
+              <span>已排除账号 {disabledDiscoveredAccounts.length}</span>
+              <ChevronDown
+                className={`h-4 w-4 transition-transform ${disabledAccountsOpen ? 'rotate-180' : ''}`}
+              />
+            </button>
+            {disabledAccountsOpen && (
+              <div className="mt-2 space-y-2">
+                {disabledDiscoveredAccounts.map((account) => (
+                  <div
+                    key={account.id}
+                    className="flex items-center justify-between gap-3 rounded-md border bg-muted/20 p-3 opacity-70"
+                  >
+                    <div className="min-w-0 space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium">{account.platform}</span>
+                        <span className="font-mono text-sm">{account.account_id}</span>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        最后上报于 {new Date(account.last_seen_at).toLocaleString()}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={mutatingAccountId === account.id}
+                      className="text-muted-foreground hover:text-primary focus-visible:ring-ring inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md transition-colors focus-visible:ring-2 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50"
+                      aria-label="恢复身份"
+                      title="恢复身份"
+                      onClick={() => void toggleDiscoveredAccount(account)}
+                    >
+                      <RotateCcw className="h-4 w-4" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {accountsError && (
+          <p className="flex items-center gap-1 text-xs text-destructive">
+            <AlertCircle className="h-3.5 w-3.5" />
+            {accountsError}
+          </p>
+        )}
       </div>
 
-      <div className="space-y-2">
-        <div className={PLATFORM_ACCOUNT_ROW_GRID_CLASS}>
-          <div className="min-w-0 space-y-1">
-            <Label className="text-xs">平台</Label>
-            <Input
-              className="min-w-0"
-              value={primaryPlatform}
-              placeholder="qq"
-              onChange={(event) => onChange?.(event.target.value)}
-            />
+      <div className="flex items-center justify-between gap-2">
+        <button
+          type="button"
+          className="hover:text-primary flex min-w-0 flex-1 items-center gap-2 text-left transition-colors"
+          aria-expanded={fallbackAccountsOpen}
+          onClick={() => setFallbackAccountsOpen((open) => !open)}
+        >
+          <ChevronDown
+            className={`h-4 w-4 shrink-0 transition-transform ${fallbackAccountsOpen ? 'rotate-180' : ''}`}
+          />
+          <span className="text-[15px] font-semibold leading-6">备用平台账号</span>
+        </button>
+        {fallbackAccountsOpen && (
+          <Button
+            type="button"
+            size="icon"
+            variant="outline"
+            className="shrink-0"
+            aria-label="添加平台"
+            title="添加平台"
+            onClick={addRow}
+          >
+            <Plus className="h-4 w-4" />
+          </Button>
+        )}
+      </div>
+
+      {fallbackAccountsOpen && (
+        <div className="space-y-2">
+          <div className={PLATFORM_ACCOUNT_ROW_GRID_CLASS}>
+            <div className="min-w-0 space-y-1">
+              <Label className="text-xs">平台</Label>
+              <Input
+                className="min-w-0"
+                value={primaryPlatform}
+                placeholder="qq"
+                onChange={(event) => onChange?.(event.target.value)}
+              />
+            </div>
+            <div className="min-w-0 space-y-1">
+              <Label className="text-xs">账号</Label>
+              <Input
+                className="min-w-0 font-mono"
+                value={qqAccount}
+                placeholder="2814567326"
+                onChange={(event) => onParentChange?.('qq_account', event.target.value)}
+              />
+            </div>
+            <div className="flex shrink-0 items-end justify-end">
+              <span className="rounded-md bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
+                主
+              </span>
+            </div>
           </div>
-          <div className="min-w-0 space-y-1">
-            <Label className="text-xs">账号</Label>
-            <Input
-              className="min-w-0 font-mono"
-              value={qqAccount}
-              placeholder="2814567326"
-              onChange={(event) => onParentChange?.('qq_account', event.target.value)}
-            />
-          </div>
-          <div className="flex shrink-0 items-end justify-end">
-            <span className="rounded-md bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
-              主
-            </span>
-          </div>
-        </div>
 
         {rows.map((row, rowIndex) => (
           <div
@@ -2989,7 +3066,8 @@ export const BotPlatformAccountsHook: FieldHookComponent = ({
             </div>
           </div>
         ))}
-      </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -3074,29 +3152,45 @@ export const ExpressionGroupsHook: FieldHookComponent = ({ fieldPath, onChange, 
   const [showAddGroupPanel, setShowAddGroupPanel] = useState(false)
   const [addingMemberGroupIndex, setAddingMemberGroupIndex] = useState<number | null>(null)
 
-  useEffect(() => {
-    if (!isSharedMemoryGroup) {
-      return
-    }
-
+  if (isSharedMemoryGroup) {
     if (globalMemorySharingEnabled) {
       const allGroupIndexes = new Set(Array.from({ length: groups.length }, (_, index) => index))
-      setCollapsedGroups(allGroupIndexes)
-      setShowAddGroupPanel(false)
-      setAddingMemberGroupIndex(null)
-      return
-    }
-
-    setCollapsedGroups((current) => {
-      const next = new Set<number>()
-      current.forEach((index) => {
-        if (index < groups.length) {
-          next.add(index)
+      let collapsedSame = collapsedGroups.size === allGroupIndexes.size
+      if (collapsedSame) {
+        for (const index of allGroupIndexes) {
+          if (!collapsedGroups.has(index)) {
+            collapsedSame = false
+            break
+          }
+        }
+      }
+      if (!collapsedSame) {
+        setCollapsedGroups(allGroupIndexes)
+      }
+      if (showAddGroupPanel) {
+        setShowAddGroupPanel(false)
+      }
+      if (addingMemberGroupIndex !== null) {
+        setAddingMemberGroupIndex(null)
+      }
+    } else {
+      let needsPrune = false
+      collapsedGroups.forEach((index) => {
+        if (index >= groups.length) {
+          needsPrune = true
         }
       })
-      return next
-    })
-  }, [globalMemorySharingEnabled, groups.length, isSharedMemoryGroup])
+      if (needsPrune) {
+        const next = new Set<number>()
+        collapsedGroups.forEach((index) => {
+          if (index < groups.length) {
+            next.add(index)
+          }
+        })
+        setCollapsedGroups(next)
+      }
+    }
+  }
 
   useEffect(() => {
     if (!isSharedMemoryGroup) {
@@ -3274,10 +3368,6 @@ export const ExpressionGroupsHook: FieldHookComponent = ({ fieldPath, onChange, 
             title={globalMemorySharingEnabled ? '全局共享开启时不需要配置共享组' : `添加${groupLabel}`}
             disabled={globalMemorySharingEnabled}
             onClick={() => {
-              if (isSharedMemoryGroup) {
-                addGroup('chat', 'group')
-                return
-              }
               setShowAddGroupPanel(true)
             }}
           >
@@ -3287,7 +3377,7 @@ export const ExpressionGroupsHook: FieldHookComponent = ({ fieldPath, onChange, 
       </div>
 
       <AddGroupTargetDialog
-        open={showAddGroupPanel && !globalMemorySharingEnabled && !isSharedMemoryGroup}
+        open={showAddGroupPanel && !globalMemorySharingEnabled}
         title={`选择${groupLabel}的第一个成员`}
         onAdd={addGroup}
         onOpenChange={(open) => {
@@ -3337,11 +3427,9 @@ export const ExpressionGroupsHook: FieldHookComponent = ({ fieldPath, onChange, 
                       title={globalMemorySharingEnabled ? '全局共享开启时共享组已折叠' : '添加成员'}
                       disabled={globalMemorySharingEnabled}
                       onClick={() =>
-                        isSharedMemoryGroup
-                          ? addMember(groupIndex, 'chat', 'group')
-                          : setAddingMemberGroupIndex((currentGroupIndex) =>
-                              currentGroupIndex === groupIndex ? null : groupIndex,
-                            )
+                        setAddingMemberGroupIndex((currentGroupIndex) =>
+                          currentGroupIndex === groupIndex ? null : groupIndex,
+                        )
                       }
                     >
                       <Plus className="h-4 w-4" />
@@ -3412,7 +3500,7 @@ export const ExpressionGroupsHook: FieldHookComponent = ({ fieldPath, onChange, 
         </div>
       )}
       <AddGroupTargetDialog
-        open={addingMemberGroupIndex !== null && !globalMemorySharingEnabled && !isSharedMemoryGroup}
+        open={addingMemberGroupIndex !== null && !globalMemorySharingEnabled}
         title={`选择${groupLabel} ${
           addingMemberGroupIndex === null ? '' : addingMemberGroupIndex + 1
         } 的新成员`}
