@@ -20,9 +20,11 @@ object Waker {
         val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
         if (pm.isInteractive) return "already-on"
 
-        // 1
-        runCatching { pm.wakeUp(SystemClock.uptimeMillis()) }
-            .onFailure { Log.d(TAG, "wakeUp() 被拒: ${it::class.java.simpleName}") }
+        // 1：SDK 里没有公开的 wakeUp(long)，只能反射
+        runCatching {
+            val method = pm.javaClass.getMethod("wakeUp", Long::class.javaPrimitiveType)
+            method.invoke(pm, SystemClock.uptimeMillis())
+        }.onFailure { Log.d(TAG, "wakeUp() 被拒: ${it::class.java.simpleName}") }
         if (pm.isInteractive) {
             dismiss(ctx)
             return "wakeUp"
