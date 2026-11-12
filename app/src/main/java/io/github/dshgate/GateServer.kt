@@ -22,7 +22,7 @@ import kotlin.concurrent.thread
  * POST /wake              → 点亮屏幕
  * POST /config            → body: packages=com.tencent.mobileqq,xxx
  */
-class GateServer(private val ctx: Context, private val port: Int = 8747) {
+class GateServer(private val ctx: Context, private val port: Int = 8799) {
     @Volatile private var running = false
     private var server: ServerSocket? = null
 

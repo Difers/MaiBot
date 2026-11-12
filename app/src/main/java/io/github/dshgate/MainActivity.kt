@@ -48,6 +48,10 @@ class MainActivity : Activity() {
         button("刷新状态") { refresh() }
 
         setContentView(root)
+
+        // 打开就把桥架起来，少一步手动操作
+        runCatching { startService(Intent(this, GateService::class.java)) }
+        refresh()
     }
 
     override fun onResume() {
