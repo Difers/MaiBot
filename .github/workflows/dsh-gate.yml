@@ -2,7 +2,7 @@ name: dsh-gate apk
 on:
   workflow_dispatch:
   push:
-    branches: [apk]
+    tags: ['dsh-gate-v*']
 
 jobs:
   apk:
@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: apk
+          ref: dsh-gate-v1
 
       - uses: actions/setup-java@v4
         with:
@@ -24,10 +24,8 @@ jobs:
         run: |
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           [ -x "$SDKMANAGER" ] || SDKMANAGER="$(command -v sdkmanager)"
-          echo "sdkmanager: $SDKMANAGER"
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
           "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" > /dev/null
-          ls "$ANDROID_HOME/platforms"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
